@@ -5,7 +5,8 @@
 ใช้ลงข้อมูลปริมาณของเสียที่จัดเก็บในโรงงาน: เลือกประเภทของเสีย กรอกน้ำหนัก (กก.) และภาชนะบรรจุ (ถัง 200 ลิตร / IBC / Bigbag)
 แล้วติดตามยอดคงเหลือ การส่งกำจัด และการใช้โควตาตามปริมาณที่ได้รับอนุญาต
 
-- หน้าเว็บ: GitHub Pages จากโฟลเดอร์ `docs/` → https://watanathep8-dotcom.github.io/waste-management/
+- รีโป: https://github.com/watanathep8-dotcom/balance-waste-nap
+- หน้าเว็บ: GitHub Pages จากโฟลเดอร์ `docs/` → https://watanathep8-dotcom.github.io/balance-waste-nap/
 - Backend: Google Apps Script (`apps-script/Code.gs` ไฟล์เดียว) เก็บข้อมูลใน Google Sheets
 
 ## ความสามารถ
@@ -27,7 +28,7 @@
 
 ## ติดตั้ง (ครั้งแรก)
 
-1. สร้างโปรเจกต์ใหม่ที่ https://script.google.com แล้ววางเนื้อหา `apps-script/Code.gs`
+1. สร้างโปรเจกต์ใหม่ที่ https://script.google.com ตั้งชื่อโปรเจกต์ **Balance Waste Nap** แล้ววางเนื้อหา `apps-script/Code.gs`
    (และตั้งค่า `appsscript.json` ตามไฟล์ในรีโป: เขตเวลา Asia/Bangkok, V8)
 2. **Project Settings → Script properties** เพิ่ม:
 
@@ -47,7 +48,8 @@
    ```js
    window.WASTE_CONFIG = { apiUrl: "https://script.google.com/macros/s/XXXX/exec" };
    ```
-6. เปิด GitHub Pages: Settings → Pages → Branch `main` / folder `/docs`
+6. เปิด GitHub Pages ของรีโป `watanathep8-dotcom/balance-waste-nap`: Settings → Pages → Branch `main` / folder `/docs`
+   → https://watanathep8-dotcom.github.io/balance-waste-nap/
 
 ฟังก์ชันอื่นที่รันจากตัวแก้ไขได้: `clearReadCache()` (หลังแก้สเปรดชีตด้วยมือ), `removeKeepWarmTrigger()`
 
