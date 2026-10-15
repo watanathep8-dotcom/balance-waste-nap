@@ -133,7 +133,7 @@ function createGas() {
     CacheService: {
       getScriptCache() {
         return {
-          get: k => (k in state.cache ? state.cache[k] : null),
+          get: k => { if (state.cacheDown) throw new Error("Cache down"); return k in state.cache ? state.cache[k] : null; },
           put: (k, v, ttl) => { state.cache[k] = String(v); state.cachePuts.push(ttl); },
           remove: k => { delete state.cache[k]; },
           // Batch calls (read cache / data versions); tracked apart from put().
@@ -287,7 +287,7 @@ test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permit
   assert.strictEqual(ss.name, "Balance Waste Database");
   assert.deepStrictEqual(ss.getSheets().map(s => s.getName()), ["waste_types", "movements", "audit_logs"]);
   assert.deepStrictEqual(sheet("waste_types").data[0], ["id", "code", "name", "permit_tons", "mgmt_code", "receiver_reg", "receiver", "icon", "color", "active", "sort", "updated_at", "updated_by"]);
-  assert.deepStrictEqual(sheet("movements").data[0], ["id", "doc_no", "kind", "type_id", "weight_kg", "container", "containers", "location", "manifest_no", "vehicle", "note", "moved_at", "created_at", "actor", "updated_at", "updated_by"]);
+  assert.deepStrictEqual(sheet("movements").data[0], ["id", "doc_no", "kind", "type_id", "weight_kg", "container", "containers", "location", "manifest_no", "vehicle", "note", "moved_at", "created_at", "actor", "updated_at", "updated_by", "method"]);
   assert.strictEqual(dataRows("waste_types"), 13);
   assert.strictEqual(dataRows("movements"), 0);
   state.props.WASTE_RESET_PASSWORD = RPW;
@@ -334,7 +334,7 @@ test("setupSystem is idempotent (no second spreadsheet, no duplicate seed)", () 
 test("GET: service info, unknown action, writes and logs refused over GET", () => {
   assert.strictEqual(okData(get("")).service, "Balance Waste API");
   err(get("nope"), /Unknown action/);
-  for (const a of ["store", "ship", "opening", "movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export", "verifyResetPassword"]) err(get(a), /POST/);
+  for (const a of ["store", "ship", "opening", "treat", "treat_unlock", "treat_lock", "movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export", "verifyResetPassword"]) err(get(a), /POST/);
   const bad = JSON.parse(ctx.doPost({ postData: { contents: "{oops" } }).getContent());
   err(bad, /JSON/);
   err(postRaw({ action: "nope" }), /Unknown action/);
@@ -342,7 +342,7 @@ test("GET: service info, unknown action, writes and logs refused over GET", () =
 
 test("actor name required for every write (empty / whitespace / object rejected, nothing written)", () => {
   for (const who of [null, "", "   ", { x: 1 }]) {
-    for (const a of ["store", "ship", "opening", "movement_update", "movement_delete", "type_save", "reset_data"]) {
+    for (const a of ["store", "ship", "opening", "treat", "movement_update", "movement_delete", "type_save", "reset_data"]) {
       const r = postRaw(Object.assign({ action: a, type_id: 1, weight_kg: 5, container: "drum200", containers: 1, resetPassword: RPW }, who && typeof who === "object" ? { actor: who } : {}), typeof who === "string" ? who : null);
       err(r, /ระบุชื่อผู้ใช้งาน/);
       assert.strictEqual(r.code, "NAME_REQUIRED");
@@ -567,6 +567,222 @@ test("CSV export: Thai headers, codes keep leading zeros, formula-like text neut
   assert.strictEqual(lines.length - 1, okData(get("history", { type: "5" })).items.length);
   const row = sheet("movements").data.find(x => String(x[10]).includes("HYPERLINK"));
   assert.strictEqual(row[10], "=HYPERLINK(\"http://x\")"); // stored as text via apostrophe
+});
+
+/* ---------- in-house treatment (บำบัดเองภายใน) + hidden mode ---------- */
+const unlock = () => okData(postRaw({ action: "treat_unlock", resetPassword: RPW }, null)).token;
+// a read sent as POST with a treatment token (the page does this while unlocked)
+const tread = (tok, action, params = {}) => okData(postRaw(Object.assign({ action, treatToken: tok }, params), null));
+let TT = "";
+let TR1 = null;
+
+test("treat: POST only; locked without a token; unlock needs the admin password (same lockout), audited", () => {
+  const before = dataRows("movements");
+  let r = err(mv("treat", 11, 5), /ล็อก/);
+  assert.strictEqual(r.code, "TREAT_LOCKED");
+  err(mv("treat", 11, 5, { treatToken: "x".repeat(64) }), /ล็อก/);
+  err(mv("treat", 11, 5, { treatToken: "a".repeat(64) }), /ล็อก/); // well-formed but never issued
+  clearFails();
+  r = err(postRaw({ action: "treat_unlock", resetPassword: "bad" }, null), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(r.passwordError, true);
+  assert.strictEqual(state.cache.WASTE_RESET_FAILURES, "1"); // same counter as every admin password check
+  err(postRaw({ action: "treat_unlock" }, null), /รหัสไม่ถูกต้อง/);
+  state.cache.WASTE_RESET_FAILURES = "10";
+  err(postRaw({ action: "treat_unlock", resetPassword: RPW }, null), /หลายครั้งเกินไป/);
+  clearFails();
+  const puts = state.cachePuts.length;
+  TT = unlock();
+  assert.ok(/^[0-9a-f]{64}$/.test(TT));
+  assert.ok(state.cachePuts.slice(puts).includes(21600), "token kept 6 h (CacheService maximum)");
+  assert.ok(Number(state.cache["WASTE_TT_" + TT]) > Date.now());
+  assert.strictEqual(dataRows("movements"), before);
+  assert.strictEqual(lastLog().action, "treat_unlock");
+  assert.ok(!JSON.stringify(sheet("audit_logs").data).includes(TT), "token never in the audit log");
+});
+
+test("treat: lowers the in-plant balance like a shipment but is never counted in the สก.2 quota", () => {
+  okData(mv("store", 12, 300, { container: "drum200", containers: 3, ...at(6) }));
+  okData(mv("ship", 12, 100, { container: "drum200", containers: 1, ...at(4) }));
+  const d0 = tread(TT, "dashboard");
+  const r = okData(mv("treat", 12, 150, { container: "drum200", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", note: "ทดสอบ", treatToken: TT, ...at(3) }));
+  TR1 = r;
+  assert.strictEqual(r.doc_no, "TR-" + YMD + "-0001");
+  assert.strictEqual(r.kind, "treat");
+  assert.strictEqual(r.balance_kg, 50);
+  assert.ok(/บำบัดเองภายใน/.test(r.message));
+  const row = sheet("movements").data.find(x => x[1] === r.doc_no);
+  assert.strictEqual(row[2], "treat");
+  assert.strictEqual(row[16], "ระบบบำบัดน้ำเสียภายในโรงงาน"); // method: appended column
+  assert.strictEqual(row[8], ""); // no manifest / vehicle for a treatment
+  // hidden (anonymous) view: true balance, quota counts the shipment only, no treatment totals
+  const b = bal(12);
+  assert.strictEqual(b.balance_kg, 50);
+  assert.strictEqual(b.containers.drum200, 1);
+  assert.strictEqual(b.shipped_kg, 100);
+  assert.strictEqual(b.shipped_year_kg, 100);
+  assert.strictEqual(b.permit_kg, 500);
+  assert.strictEqual(b.quota_pct, 20);
+  assert.ok(!("treated_kg" in b) && !("treated_year_kg" in b));
+  assert.strictEqual(boot().treat, false);
+  // unlocked view: the treatment totals add up
+  const bt = tread(TT, "bootstrap");
+  assert.strictEqual(bt.treat, true);
+  const u = bt.balance[12];
+  assert.strictEqual(u.treated_kg, 150);
+  assert.strictEqual(u.treated_year_kg, 150);
+  assert.strictEqual(u.quota_pct, 20);
+  assert.strictEqual(Math.round((u.in_kg - u.shipped_kg - u.treated_kg) * 100) / 100, u.balance_kg);
+  const d = tread(TT, "dashboard");
+  assert.strictEqual(d.kpi.year_out_kg, d0.kpi.year_out_kg, "quota use unchanged by a treatment");
+  assert.strictEqual(d.kpi.quota_pct, d0.kpi.quota_pct);
+  assert.deepStrictEqual(d.receivers.map(x => x.shipped_year_kg), d0.receivers.map(x => x.shipped_year_kg));
+  assert.strictEqual(Math.round((d.kpi.treated_kg - d0.kpi.treated_kg) * 100) / 100, 150);
+  const k = d.kpi;
+  assert.strictEqual(Math.round(k.total_in_kg * 100), Math.round(k.shipped_kg * 100) + Math.round(k.treated_kg * 100) + Math.round(k.balance_kg * 100));
+  assert.ok(k.year_treat_kg >= 150 && k.month_treat_kg >= 0);
+  assert.ok(d.months.reduce((a, m) => a + m.treat_kg, 0) >= 150);
+  assert.ok(!d.alerts.some(a => a.type_id === 12 && a.kind === "quota"));
+  const l = logs()[0];
+  assert.strictEqual(l.action, "treat");
+  assert.strictEqual(l.ref, r.doc_no);
+  assert.ok(l.detail.includes("บำบัดเองภายใน") && l.detail.includes("วิธีบำบัด: ระบบบำบัดน้ำเสียภายในโรงงาน") && l.actor === ACTOR);
+});
+
+test("treat: cannot exceed the balance or containers (chronological replay); hidden error never names the treatment row", () => {
+  const before = dataRows("movements");
+  let r = err(mv("treat", 12, "50.01", { treatToken: TT, ...at(2) }), /บำบัดเกินยอดคงเหลือ/);
+  assert.strictEqual(r.code, "NEGATIVE_BALANCE");
+  err(mv("treat", 12, 10, { containers: 2, treatToken: TT, ...at(2) }), /ถัง 200 ลิตร.*มี 1 ภาชนะ แต่ต้องนำออก 2/);
+  err(mv("treat", 12, 10, { container: "ibc", treatToken: TT, ...at(2) }), /IBC/);
+  err(mv("treat", 4, 1, { treatToken: TT, ...at(2) }), /มี 0 กก\./);
+  err(mv("treat", 12, 10, { treatToken: TT, ...at(7) }), /บำบัดเกินยอดคงเหลือ/); // before the stock existed
+  err(mv("treat", 12, 10, { method: "x".repeat(121), treatToken: TT, ...at(2) }), /วิธีบำบัด \/ ระบบยาวเกิน 120/);
+  // a back-dated shipment that would make the later treatment negative
+  r = err(mv("ship", 12, 60, { ...at(5) }), /ติดลบในรายการภายหลัง/);
+  assert.ok(!/TR-|บำบัด/.test(r.error), r.error);
+  r = err(mv("ship", 12, 60, { treatToken: TT, ...at(5) }), /ติดลบที่รายการ TR-.*บำบัดเองภายใน/);
+  assert.strictEqual(dataRows("movements"), before);
+  okData(mv("treat", 12, "0.5", { treatToken: TT, ...at(2) }));
+  assert.strictEqual(bal(12).balance_kg, 49.5);
+});
+
+test("hidden mode: history / CSV / dashboard / batch leave out treatment rows; token reads (POST) include them", () => {
+  const all = okData(get("history")).items;
+  assert.ok(all.length > 0 && all.every(m => m.kind !== "treat"));
+  assert.strictEqual(all.length, dataRows("movements") - 2);
+  assert.strictEqual(okData(get("history", { kind: "treat" })).items.length, 0);
+  assert.strictEqual(okData(get("history", { q: "บำบัดน้ำเสีย" })).items.length, 0);
+  assert.strictEqual(okData(get("history", { q: "TR-" })).items.length, 0);
+  // a token in a GET query is ignored (tokens travel in POST bodies only)
+  assert.ok(okData(get("history", { treatToken: TT })).items.every(m => m.kind !== "treat"));
+  assert.strictEqual(okData(get("bootstrap", { treatToken: TT })).treat, false);
+  const dh = okData(get("dashboard"));
+  assert.ok(!/treat|TR-/.test(JSON.stringify(dh)), "no treatment data in the hidden dashboard");
+  assert.ok(dh.recent.every(m => m.kind !== "treat"));
+  assert.ok(!/treated|TR-/.test(JSON.stringify(boot())));
+  // unlocked
+  const th = tread(TT, "history", { kind: "treat" }).items;
+  assert.strictEqual(th.length, 2);
+  assert.strictEqual(th[1].method, "ระบบบำบัดน้ำเสียภายในโรงงาน");
+  assert.strictEqual(tread(TT, "history").items.length, dataRows("movements"));
+  assert.strictEqual(tread(TT, "history", { q: "บำบัดน้ำเสีย" }).items.length, 1);
+  assert.ok(tread(TT, "dashboard").recent.some(m => m.kind === "treat"));
+  const bt = tread(TT, "batch", { reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] });
+  assert.strictEqual(bt.results[0].treat, true);
+  assert.strictEqual(bt.results[1].items.length, 2);
+  const bh = okData(get("batch", { reads: JSON.stringify([{ action: "history", kind: "treat" }]) }));
+  assert.strictEqual(bh.results[0].items.length, 0);
+  // CSV
+  const c0 = okData(get("export", { type: "12" })).csv;
+  assert.ok(!/TR-|บำบัด|วิธีบำบัด/.test(c0), "hidden CSV has no treatment rows / column");
+  const c1 = tread(TT, "export", { type: "12" }).csv;
+  const lines = c1.trim().split("\n");
+  assert.ok(lines[0].endsWith(",ผู้บันทึก,\"วิธีบำบัด / ระบบ\""), lines[0]);
+  const tr = lines.find(x => x.startsWith(TR1.doc_no));
+  assert.ok(tr && tr.includes(",บำบัดเองภายใน,") && tr.includes(",บำบัดเองภายในโรงงาน,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
+  assert.strictEqual(lines.length - 1, tread(TT, "history", { type: "12" }).items.length);
+  // a write carrying reads answers in the mode of its token
+  const w0 = okData(mv("store", 12, 1, { ...at(1), reads: [{ action: "bootstrap" }] }));
+  assert.strictEqual(w0.reads[0].treat, false);
+  assert.ok(!("treated_kg" in w0.reads[0].balance[12]));
+  const w1 = okData(mv("store", 12, 1, { ...at(1), treatToken: TT, reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
+  assert.strictEqual(w1.reads[0].treat, true);
+  assert.strictEqual(w1.reads[0].balance[12].treated_kg, 150.5);
+  assert.strictEqual(w1.reads[1].items.length, 2);
+  // dashboard "logs today" count leaves out treatment audit rows when hidden
+  assert.ok(okData(get("dashboard")).logsToday < tread(TT, "dashboard").logsToday);
+});
+
+test("treat token: lock drops it; an expired / evicted token is refused for reads and writes", () => {
+  const t2 = unlock();
+  assert.strictEqual(tread(t2, "bootstrap").treat, true);
+  assert.strictEqual(okData(postRaw({ action: "treat_lock", treatToken: t2 }, null)).locked, true);
+  assert.ok(!("WASTE_TT_" + t2 in state.cache));
+  assert.strictEqual(tread(t2, "bootstrap").treat, false);
+  assert.strictEqual(tread(t2, "history", { kind: "treat" }).items.length, 0);
+  err(mv("treat", 12, 1, { treatToken: t2, ...at(1) }), /ล็อก/);
+  okData(postRaw({ action: "treat_lock", treatToken: "nope" }, null)); // harmless
+  const t3 = unlock();
+  state.cache["WASTE_TT_" + t3] = String(Date.now() - 1); // expired
+  assert.strictEqual(tread(t3, "bootstrap").treat, false);
+  err(mv("treat", 12, 1, { treatToken: t3, ...at(1) }), /ล็อก/);
+  delete state.cache["WASTE_TT_" + t3]; // evicted
+  assert.strictEqual(tread(t3, "dashboard").kpi.treated_kg, undefined);
+  state.cacheDown = true; // cache outage: locked, reads still answer
+  try { assert.strictEqual(tread(TT, "bootstrap").treat, false); } finally { state.cacheDown = false; }
+  assert.strictEqual(tread(TT, "bootstrap").treat, true); // the first token still works
+});
+
+test("treat rows: edit / delete with the admin password like any row (replay checked, audited)", () => {
+  const id = TR1.id;
+  err(postRaw({ action: "movement_update", id, weight_kg: 100 }), /รหัสไม่ถูกต้อง/);
+  clearFails();
+  // stock of type 12: 300 + 1 + 1 in, 100 shipped, 150 + 0.5 treated -> 51.5 left
+  err(post("movement_update", { id, doc_no: TR1.doc_no, weight_kg: "201.51" }), /แก้ไขไม่ได้/);
+  err(post("movement_update", { id, kind: "ship" }), /เปลี่ยนชนิดรายการไม่ได้/);
+  const ok = okData(post("movement_update", { id, doc_no: TR1.doc_no, weight_kg: 120, method: "เตาเผาภายในโรงงาน" }));
+  assert.strictEqual(ok.changed, true);
+  assert.strictEqual(bal(12).balance_kg, 81.5);
+  assert.strictEqual(bal(12).quota_pct, 20);
+  const row = sheet("movements").data.find(x => x[1] === TR1.doc_no);
+  assert.strictEqual(row[4], 120);
+  assert.strictEqual(row[16], "เตาเผาภายในโรงงาน");
+  const l = lastLog();
+  assert.strictEqual(l.action, "movement_update");
+  assert.ok(l.detail.includes("ระบบบำบัดน้ำเสียภายในโรงงาน") && l.detail.includes("เตาเผาภายในโรงงาน"));
+  // a store the treatment depends on cannot be deleted; the treatment itself can
+  const b6 = bal(6).balance_kg;
+  const st = okData(mv("store", 6, 40, { container: "ibc", containers: 1, ...at(9) }));
+  const tr = okData(mv("treat", 6, 40, { container: "ibc", containers: 1, treatToken: TT, ...at(8) }));
+  err(post("movement_delete", { id: st.id, doc_no: st.doc_no }), /ลบไม่ได้.*ติดลบในรายการภายหลัง/);
+  okData(post("movement_delete", { id: tr.id, doc_no: tr.doc_no }));
+  assert.strictEqual(lastLog().action, "movement_delete");
+  okData(post("movement_delete", { id: st.id, doc_no: st.doc_no }));
+  assert.strictEqual(bal(6).balance_kg, b6);
+});
+
+test("migration: an older movements sheet without the method column keeps working (column appended on first use)", () => {
+  const g = createGas();
+  const c2 = loadCode(g.gas);
+  c2.setupSystem();
+  g.state.props.WASTE_RESET_PASSWORD = RPW;
+  const ss = g.state.spreadsheets[g.state.props.WASTE_SPREADSHEET_ID];
+  const ms = ss.getSheetByName("movements");
+  const p = body => JSON.parse(c2.doPost({ postData: { contents: JSON.stringify(Object.assign({ actor: ACTOR }, body)) } }).getContent());
+  okData(p({ action: "store", type_id: 13, weight_kg: 500, container: "ibc", containers: 1, ...at(3) }));
+  // simulate the sheet as created by the previous version: no "method" column
+  ms.data.forEach(row => { row.length = 16; });
+  assert.ok(!ms.data[0].includes("method"));
+  c2.clearReadCache();
+  const g0 = JSON.parse(c2.doGet({ parameter: { action: "bootstrap" } }).getContent());
+  assert.strictEqual(okData(g0).balance[13].balance_kg, 500);
+  assert.strictEqual(ms.data[0][16], "method", "column appended to the header");
+  const tok = okData(p({ action: "treat_unlock", resetPassword: RPW })).token;
+  const r = okData(p({ action: "treat", type_id: 13, weight_kg: 200, container: "ibc", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", treatToken: tok, ...at(2) }));
+  assert.strictEqual(r.balance_kg, 300);
+  const row = ms.data.find(x => x[1] === r.doc_no);
+  assert.strictEqual(row[16], "ระบบบำบัดน้ำเสียภายในโรงงาน");
+  assert.strictEqual(ms.data[1][16] || "", ""); // the old row reads the new column as empty
 });
 
 /* ---------- password gating ---------- */
@@ -843,6 +1059,11 @@ test("docs JS files parse; config shape; GET with _=ts; POST text/plain; actor s
   assert.ok(!/(local|session)Storage\.setItem\([^)]*([Pp]ass|[Rr]eset)/.test(app));
   assert.ok(!/store\('set', *'[^']*([Pp]ass|[Rr]eset)/.test(app));
   assert.ok(!/RC_PREFIX[^\n]*logs/.test(app));
+  // treatment view: token only in POST bodies / sessionStorage, never in a URL or the localStorage read cache
+  assert.ok(app.includes("sessionStorage.setItem(TT_KEY") && !/localStorage\.setItem\(TT_KEY/.test(app));
+  assert.ok(!/searchParams\.set\([^)]*treat/i.test(app) && app.includes("if (S.tt) body.treatToken = S.tt"));
+  assert.ok(app.includes("if (S.tt) return null;") && app.includes("if (!d || S.tt) return;"));
+  for (const a of ["'treat_unlock'", "'treat_lock'", "treat: () => txForm('treat')", "k !== 'treat' || treatOn()"]) assert.ok(app.includes(a), a);
   // client-side checks mirror the server (2 decimals, ship <= balance)
   assert.ok(app.includes("/^\\d+(\\.\\d{1,2})?$/"));
   assert.ok(app.includes("เกินยอดคงเหลือ"));
@@ -865,6 +1086,9 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(html.includes("https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"));
   assert.ok(html.includes("family=Kanit") && html.includes("Prompt"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"') && html.includes('data-page="settings"'));
+  assert.ok(/data-page="treat"[^>]*hidden/.test(html) && html.includes('id="treatLock"'), "treatment menu hidden by default + lock control");
+  assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
+  assert.ok(html.includes("assets/app.js?v=2") && html.includes("assets/style.css?v=2"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });

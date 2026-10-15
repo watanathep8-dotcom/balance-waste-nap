@@ -33,6 +33,8 @@ function seedDemo() {
     [7, 6, "drum200"], [8, 10, "bigbag"], [9, 140, "bigbag"], [10, 150, "bigbag"], [11, 420, "ibc"], [13, 900, "ibc"]];
   post({ action: "opening", type_id: 13, weight_kg: "54000", container: "ibc", containers: "54", ...day(330, 8), note: "ตัวอย่าง" });
   post({ action: "opening", type_id: 11, weight_kg: "25000", container: "ibc", containers: "25", ...day(330, 8), note: "ตัวอย่าง" });
+  // in-house treatment (บำบัดเองภายใน) needs the treatment token of the mock
+  const treatToken = post({ action: "treat_unlock", resetPassword: state.props.WASTE_RESET_PASSWORD }).data.token;
   for (let back = 320; back >= 0; back -= 9) {
     plan.forEach(([id, kg, c]) => {
       if (rnd() < 0.45) {
@@ -52,6 +54,12 @@ function seedDemo() {
           post({ action: "ship", type_id: id, weight_kg: String(w), container: c, containers: String(take), manifest_no: "MN-" + (1000 + back), vehicle: "70-" + (1000 + Math.floor(rnd() * 8999)), ...day(back, 15) });
         }
       });
+    }
+    if (back % 27 >= 18 && rnd() < 0.7) {
+      // part of the machine wash water goes to the plant's own wastewater system
+      const b = JSON.parse(ctx.doGet({ parameter: { action: "bootstrap" } }).getContent()).data.balance[13];
+      const take = Math.min(b.containers.ibc, 1 + Math.floor(rnd() * 2));
+      if (take > 0) post({ action: "treat", type_id: 13, weight_kg: String(Math.min(take * 1000, b.balance_kg)), container: "ibc", containers: String(take), method: "ระบบบำบัดน้ำเสียภายในโรงงาน", treatToken, ...day(back, 11) });
     }
   }
 }

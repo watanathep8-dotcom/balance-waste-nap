@@ -25,6 +25,17 @@
  * every (waste type, container) pair must never go below zero at any moment.
  * Nothing is written unless the replay passes.
  *
+ * In-house treatment (kind "treat", บำบัดเองภายใน): waste treated inside the
+ * plant (e.g. the plant's own wastewater treatment system). It leaves the
+ * in-plant balance exactly like a shipment (same replay / container checks) but
+ * is NOT a shipment: the สก.2 quota (quota %, receiver quotas) counts "ship"
+ * only. Treatment data is hidden by default: the read APIs leave out treatment
+ * rows and totals (balances stay true: balance = in - shipped - treated) unless
+ * the request carries a treatment token (treatToken, POST only). treat_unlock
+ * (WASTE_RESET_PASSWORD, same lockout) issues a token kept in CacheService for
+ * TREAT_TOKEN_TTL seconds; treat_lock drops it. Writing "treat" needs a token.
+ * Every treatment row is still in the movements sheet and in audit_logs.
+ *
  * Optional: run installKeepWarmTrigger() once from the editor; a 10-minute
  * trigger then runs keepWarm() (read-only) to keep the read cache hot.
  *
@@ -59,11 +70,12 @@ var COMPANY = {
 
 var CONTAINERS = { drum200: "ถัง 200 ลิตร", ibc: "IBC", bigbag: "Bigbag" };
 var CONTAINER_KEYS = ["drum200", "ibc", "bigbag"];
-var KIND_NAME = { store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด / นำออก", opening: "ยอดยกมา" };
-var KINDS = ["store", "ship", "opening"];
-var PREFIX = { store: "ST", ship: "SH", opening: "OB" };
+var KIND_NAME = { store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด / นำออก", opening: "ยอดยกมา", treat: "บำบัดเองภายใน" };
+var KINDS = ["store", "ship", "opening", "treat"];
+var OUT_KINDS = ["ship", "treat"]; // leave the in-plant balance
+var PREFIX = { store: "ST", ship: "SH", opening: "OB", treat: "TR" };
 var ACT_NAME = {
-  store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด", opening: "ยอดยกมา",
+  store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด", opening: "ยอดยกมา", treat: "บำบัดเองภายใน",
   movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ", type_save: "ตั้งค่าประเภทของเสีย"
 };
 var LOG_CAT_NAME = { waste: "ของเสีย", edit: "แก้ไข / ลบ", setting: "ตั้งค่า", warn: "ถูกปฏิเสธ" };
@@ -87,7 +99,7 @@ var SCHEMA = {
     ["id", "int"], ["doc_no", "str"], ["kind", "str"], ["type_id", "int"], ["weight_kg", "num"],
     ["container", "str"], ["containers", "int"], ["location", "str"], ["manifest_no", "str"], ["vehicle", "str"],
     ["note", "str"], ["moved_at", "dt"], ["created_at", "dt"], ["actor", "str"],
-    ["updated_at", "dt?"], ["updated_by", "str"]
+    ["updated_at", "dt?"], ["updated_by", "str"], ["method", "str"]
   ],
   audit_logs: [
     ["id", "int"], ["category", "str"], ["action", "str"], ["ref", "str"], ["detail", "str"],
@@ -137,8 +149,13 @@ var KEEP_WARM_TTL = 900;
 var KEEP_WARM_MINUTES = 10;
 var RC_CHUNK = 30000;
 var RC_MAX_CHUNKS = 30;
-var WRITE_ACTIONS = ["store", "ship", "opening"];
-var POST_ONLY_ACTIONS = ["verifyResetPassword"].concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, LOG_ACTIONS);
+var WRITE_ACTIONS = ["store", "ship", "opening", "treat"];
+var POST_ONLY_ACTIONS = ["verifyResetPassword", "treat_unlock", "treat_lock"].concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, LOG_ACTIONS);
+
+// Treatment visibility token (see the header comment). CacheService keeps a
+// value at most 6 hours, so that is the session length.
+var TREAT_TOKEN_PREFIX = "WASTE_TT_";
+var TREAT_TOKEN_TTL = 21600;
 
 var MAX_PERSON = 100;
 var MAX_TEXT = 255;
@@ -174,15 +191,24 @@ function doPost(e) {
     if (action === "verifyResetPassword") {
       return jsonResponse_({ ok: true, data: verifyResetPassword(payload.resetPassword) });
     }
+    if (action === "treat_lock") return jsonResponse_({ ok: true, data: treatLock_(payload.treatToken) });
+    if (action === "treat_unlock") {
+      assertResetPassword_(payload.resetPassword);
+      return runWrite_(action, payload, null);
+    }
     if (READ_ACTIONS.indexOf(action) !== -1) {
       if (LOG_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
       resetRequest_("");
+      REQ_.treat = treatTokenOk_(payload.treatToken);
       return jsonResponse_({ ok: true, data: runRead_(action, payload) });
     }
     if (WRITE_ACTIONS.indexOf(action) === -1 && RESET_PASSWORD_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
     if (payload.reads != null && payload.reads !== "") reads = parseReads_(payload.reads);
     // Every change must say who made it (name set in the page header).
     if (!actorIn_(payload)) fail_("กรุณาระบุชื่อผู้ใช้งาน (มุมขวาบน) ก่อนบันทึก", "NAME_REQUIRED");
+    if (action === "treat" && !treatTokenOk_(payload.treatToken)) {
+      fail_("โหมดบำบัดเองภายในถูกล็อก กรุณาปลดล็อกด้วยรหัสผ่านผู้ดูแลก่อน", "TREAT_LOCKED");
+    }
     // Checked before taking the lock so guessing (1 s delay) never blocks writers.
     if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
   } catch (error) {
@@ -205,8 +231,10 @@ function runWrite_(action, input, reads) {
   }
   var actor = actorIn_(input);
   var result;
+  var treat = treatTokenOk_(input.treatToken);
   try {
     resetRequest_(actor);
+    REQ_.treat = treat;
     try {
       result = handleWrite_(action, input);
       flush_();
@@ -217,6 +245,7 @@ function runWrite_(action, input, reads) {
       if (actName && action !== RESET_ACTION) {
         try {
           resetRequest_(actor);
+          REQ_.treat = treat;
           audit_("warn", action, "ปฏิเสธ" + actName + ": " + errorMessage_(error), "");
           flush_();
         } catch (ignored) {}
@@ -305,6 +334,45 @@ function cache_() {
   return CacheService.getScriptCache();
 }
 
+/* ===================== treatment visibility token ===================== */
+
+// treat_unlock (password already checked, runs under the write lock so the
+// unlock is audited). The token is random (2 UUIDs); only its cache entry
+// (value: expiry ms) makes it valid.
+function actionTreatUnlock_() {
+  var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "").toLowerCase();
+  var exp = Date.now() + TREAT_TOKEN_TTL * 1000;
+  cache_().put(TREAT_TOKEN_PREFIX + token, String(exp), TREAT_TOKEN_TTL);
+  audit_("setting", "treat_unlock", "ปลดล็อกการแสดงข้อมูลบำบัดเองภายใน (" + (TREAT_TOKEN_TTL / 3600) + " ชั่วโมง)", "");
+  return { token: token, expires_at: exp, ttl: TREAT_TOKEN_TTL, message: "แสดงข้อมูลบำบัดเองภายในแล้ว" };
+}
+
+function treatTokenOk_(token) {
+  if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) return false;
+  try {
+    var exp = Number(cache_().get(TREAT_TOKEN_PREFIX + token) || 0);
+    return exp > Date.now();
+  } catch (error) {
+    return false;
+  }
+}
+
+function treatLock_(token) {
+  if (typeof token === "string" && /^[0-9a-f]{64}$/.test(token)) {
+    try { cache_().remove(TREAT_TOKEN_PREFIX + token); } catch (ignored) {}
+  }
+  return { locked: true };
+}
+
+// True while the current request may see / write treatment data.
+function treatOn_() {
+  return Boolean(REQ_ && REQ_.treat);
+}
+
+function isOut_(kind) {
+  return OUT_KINDS.indexOf(kind) !== -1;
+}
+
 /* ===================== router ===================== */
 
 function handleRead_(action, p) {
@@ -325,6 +393,8 @@ function handleWrite_(action, input) {
     case "store": return actionMove_("store", input);
     case "ship": return actionMove_("ship", input);
     case "opening": return actionMove_("opening", input);
+    case "treat": return actionMove_("treat", input);
+    case "treat_unlock": return actionTreatUnlock_();
     case RESET_ACTION: return actionResetData_();
     case "movement_update": return actionMovementUpdate_(input);
     case "movement_delete": return actionMovementDelete_(input);
@@ -335,7 +405,7 @@ function handleWrite_(action, input) {
 
 /* ===================== balance math =====================
  * Weights are summed in integer hundredths of a kg ("cents") so 0.1 + 0.2
- * never drifts. stored = store + opening; balance = stored - shipped.
+ * never drifts. in = store + opening; balance = in - shipped - treated.
  */
 
 function cents_(kg) {
@@ -352,6 +422,8 @@ function sortedTypes_() {
 
 // Per waste type: totals, containers in storage, this year's shipments vs the
 // permitted quantity and the date of the oldest lot still in storage (FIFO).
+// treated_kg / treated_year_kg are only for requests that may see treatment
+// (see publicBalances_); balance_kg is always the true in-plant balance.
 function balances_() {
   var now = nowParts_();
   var year = now.date.slice(0, 4);
@@ -359,7 +431,7 @@ function balances_() {
   var fifo = {};
   table_("waste_types").rows.forEach(function (t) {
     out[t.id] = {
-      type_id: t.id, stored_c: 0, opening_c: 0, shipped_c: 0, year_c: 0,
+      type_id: t.id, stored_c: 0, opening_c: 0, shipped_c: 0, year_c: 0, treated_c: 0, treat_year_c: 0,
       containers: { drum200: 0, ibc: 0, bigbag: 0 }, last_at: null
     };
     fifo[t.id] = [];
@@ -368,16 +440,19 @@ function balances_() {
     var b = out[m.type_id];
     if (!b) return;
     var c = cents_(m.weight_kg);
-    var sign = m.kind === "ship" ? -1 : 1;
+    var sign = isOut_(m.kind) ? -1 : 1;
     if (m.kind === "store") b.stored_c += c;
     else if (m.kind === "opening") b.opening_c += c;
     else if (m.kind === "ship") {
       b.shipped_c += c;
       if (m.moved_at.slice(0, 4) === year) b.year_c += c;
+    } else if (m.kind === "treat") {
+      b.treated_c += c;
+      if (m.moved_at.slice(0, 4) === year) b.treat_year_c += c;
     }
     if (b.containers[m.container] !== undefined) b.containers[m.container] += sign * (m.containers || 0);
     b.last_at = m.moved_at;
-    // FIFO lots: what is shipped leaves the oldest lot first.
+    // FIFO lots: what is shipped / treated leaves the oldest lot first.
     var q = fifo[m.type_id];
     if (sign > 0) q.push({ at: m.moved_at, c: c });
     else {
@@ -393,7 +468,7 @@ function balances_() {
   table_("waste_types").rows.forEach(function (t) {
     var b = out[t.id];
     var permitC = Math.round(Number(t.permit_tons || 0) * 100000);
-    var bal = b.stored_c + b.opening_c - b.shipped_c;
+    var bal = b.stored_c + b.opening_c - b.shipped_c - b.treated_c;
     var oldest = bal > 0 && fifo[t.id].length ? fifo[t.id][0].at : null;
     out[t.id] = {
       type_id: t.id,
@@ -401,6 +476,8 @@ function balances_() {
       opening_kg: kgOf_(b.opening_c),
       in_kg: kgOf_(b.stored_c + b.opening_c),
       shipped_kg: kgOf_(b.shipped_c),
+      treated_kg: kgOf_(b.treated_c),
+      treated_year_kg: kgOf_(b.treat_year_c),
       balance_kg: kgOf_(bal),
       containers: b.containers,
       shipped_year_kg: kgOf_(b.year_c),
@@ -411,6 +488,20 @@ function balances_() {
       age_days: oldest ? Math.max(0, Math.floor((nowMs - parseDt_(oldest)) / 86400000)) : null,
       last_at: b.last_at
     };
+  });
+  return out;
+}
+
+// Balances as sent to a request: without the treatment totals when it may not
+// see treatment (the balance itself is unchanged).
+function publicBalances_(bal) {
+  if (treatOn_()) return bal;
+  var out = {};
+  Object.keys(bal).forEach(function (id) {
+    var o = plain_(bal[id]);
+    delete o.treated_kg;
+    delete o.treated_year_kg;
+    out[id] = o;
   });
   return out;
 }
@@ -433,7 +524,7 @@ function replay_(moves) {
     var m = list[i];
     var c = cents_(m.weight_kg);
     var k = m.type_id + "|" + m.container;
-    var sign = m.kind === "ship" ? -1 : 1;
+    var sign = isOut_(m.kind) ? -1 : 1;
     var beforeW = w[m.type_id] || 0;
     var beforeN = n[k] || 0;
     w[m.type_id] = beforeW + sign * c;
@@ -456,6 +547,10 @@ function validateLedger_(moves, verb, newMove) {
     : "จำนวน" + (CONTAINERS[p.move.container] || p.move.container) + "ของ " + t + " ณ " + when + " มี " + p.have +
       " ภาชนะ แต่ต้องนำออก " + p.need + " ภาชนะ";
   if (newMove && p.move === newMove) fail_(verb + " — " + detail, "NEGATIVE_BALANCE");
+  if (p.move.kind === "treat" && !treatOn_()) {
+    // Hidden mode: do not reveal the treatment row (number / kind) in the message.
+    fail_(verb + " — ยอดคงเหลือจะติดลบในรายการภายหลัง ณ " + when, "NEGATIVE_BALANCE");
+  }
   fail_(verb + " — ยอดคงเหลือจะติดลบที่รายการ " + (p.move.doc_no || "") + " (" + KIND_NAME[p.move.kind] + "): " + detail, "NEGATIVE_BALANCE");
 }
 
@@ -468,12 +563,13 @@ function typeLabel_(id) {
 
 function actionBootstrap_() {
   var now = nowParts_();
-  var core = cachedDerived_("boot_" + now.date, ["waste_types", "movements"], function () {
-    return { types: sortedTypes_().map(plain_), balance: balances_() };
+  var core = cachedDerived_("boot_" + modeTag_() + now.date, ["waste_types", "movements"], function () {
+    return { types: sortedTypes_().map(plain_), balance: publicBalances_(balances_()) };
   });
   return {
     types: core.types,
     balance: core.balance,
+    treat: treatOn_(),
     containers: CONTAINERS,
     company: COMPANY,
     limits: { quotaWarnPct: QUOTA_WARN_PCT, storageAlertDays: STORAGE_ALERT_DAYS },
@@ -481,14 +577,26 @@ function actionBootstrap_() {
   };
 }
 
+// Cache-key part for derived reads that differ by treatment visibility.
+function modeTag_() {
+  return treatOn_() ? "t_" : "";
+}
+
+// Movements a request may see (treatment rows only with a treatment token).
+function visibleMoves_() {
+  var rows = table_("movements").rows;
+  return treatOn_() ? rows : rows.filter(function (m) { return m.kind !== "treat"; });
+}
+
 function actionDashboard_() {
   var now = nowParts_();
   var month = now.date.slice(0, 7);
   var year = now.date.slice(0, 4);
-  var core = cachedDerived_("dash_" + now.date, ["waste_types", "movements", "audit_logs"], function () {
+  var core = cachedDerived_("dash_" + modeTag_() + now.date, ["waste_types", "movements", "audit_logs"], function () {
     var types = sortedTypes_();
     var bal = balances_();
-    var moves = table_("movements").rows;
+    var showTreat = treatOn_();
+    var moves = visibleMoves_();
 
     // last 12 months (oldest first): kg stored / shipped
     var months = [];
@@ -499,22 +607,25 @@ function actionDashboard_() {
       while (mm < 1) { mm += 12; yy -= 1; }
       var key = yy + "-" + pad2_(mm);
       monthIdx[key] = months.length;
-      months.push({ ym: key, in_c: 0, out_c: 0 });
+      months.push({ ym: key, in_c: 0, out_c: 0, treat_c: 0 });
     }
-    var monthIn = 0, monthOut = 0, yearIn = 0;
+    var monthIn = 0, monthOut = 0, yearIn = 0, monthTreat = 0, yearTreat = 0;
     moves.forEach(function (m) {
       var c = cents_(m.weight_kg);
       var ym = m.moved_at.slice(0, 7);
       if (monthIdx[ym] !== undefined) {
         if (m.kind === "store") months[monthIdx[ym]].in_c += c;
         if (m.kind === "ship") months[monthIdx[ym]].out_c += c;
+        if (m.kind === "treat") months[monthIdx[ym]].treat_c += c;
       }
       if (m.kind === "store" && ym === month) monthIn += c;
       if (m.kind === "ship" && ym === month) monthOut += c;
       if (m.kind === "store" && ym.slice(0, 4) === year) yearIn += c;
+      if (m.kind === "treat" && ym === month) monthTreat += c;
+      if (m.kind === "treat" && ym.slice(0, 4) === year) yearTreat += c;
     });
 
-    var totalBal = 0, totalYear = 0, totalPermit = 0;
+    var totalBal = 0, totalYear = 0, totalPermit = 0, totalIn = 0, totalShip = 0, totalTreat = 0;
     var containers = { drum200: 0, ibc: 0, bigbag: 0 };
     var receivers = {};
     var recvOrder = [];
@@ -524,6 +635,7 @@ function actionDashboard_() {
       totalBal += cents_(b.balance_kg);
       totalYear += cents_(b.shipped_year_kg);
       totalPermit += cents_(b.permit_kg);
+      totalIn += cents_(b.in_kg); totalShip += cents_(b.shipped_kg); totalTreat += cents_(b.treated_kg);
       CONTAINER_KEYS.forEach(function (k) { containers[k] += Math.max(0, b.containers[k]); });
       if (!receivers[t.receiver]) {
         receivers[t.receiver] = { receiver: t.receiver, permit_c: 0, year_c: 0, balance_c: 0, types: 0 };
@@ -542,8 +654,7 @@ function actionDashboard_() {
     alerts.sort(function (a, b) { return (a.level === "bad" ? 0 : 1) - (b.level === "bad" ? 0 : 1); });
 
     var recent = sortBy_(moves.slice(), byMovedDesc_).slice(0, 10).map(plain_);
-    return {
-      kpi: {
+    var kpi = {
         balance_kg: kgOf_(totalBal),
         month_in_kg: kgOf_(monthIn),
         month_out_kg: kgOf_(monthOut),
@@ -552,8 +663,22 @@ function actionDashboard_() {
         permit_kg: kgOf_(totalPermit),
         quota_pct: totalPermit > 0 ? Math.round(totalYear / totalPermit * 1000) / 10 : null,
         moves: moves.length
-      },
-      months: months.map(function (m) { return { ym: m.ym, in_kg: kgOf_(m.in_c), out_kg: kgOf_(m.out_c) }; }),
+    };
+    if (showTreat) {
+      // All-time totals that add up: in = shipped + treated + balance.
+      kpi.total_in_kg = kgOf_(totalIn);
+      kpi.shipped_kg = kgOf_(totalShip);
+      kpi.treated_kg = kgOf_(totalTreat);
+      kpi.month_treat_kg = kgOf_(monthTreat);
+      kpi.year_treat_kg = kgOf_(yearTreat);
+    }
+    return {
+      kpi: kpi,
+      months: months.map(function (m) {
+        var o = { ym: m.ym, in_kg: kgOf_(m.in_c), out_kg: kgOf_(m.out_c) };
+        if (showTreat) o.treat_kg = kgOf_(m.treat_c);
+        return o;
+      }),
       containers: containers,
       receivers: recvOrder.map(function (k) {
         var r = receivers[k];
@@ -565,10 +690,17 @@ function actionDashboard_() {
       }),
       alerts: alerts,
       recent: recent,
-      logsToday: table_("audit_logs").rows.filter(function (l) { return l.created_at.slice(0, 10) === now.date; }).length
+      logsToday: table_("audit_logs").rows.filter(function (l) {
+        return l.created_at.slice(0, 10) === now.date && (showTreat || !treatLog_(l));
+      }).length
     };
   });
   return core;
+}
+
+// Audit rows about treatment (left out of counts in hidden mode).
+function treatLog_(l) {
+  return l.action === "treat" || l.action === "treat_unlock" || /^TR-/.test(String(l.ref || ""));
 }
 
 function queryHistory_(p) {
@@ -579,7 +711,7 @@ function queryHistory_(p) {
   var kind = phpEmpty_(p.kind) ? null : str_(p.kind);
   var receiver = phpEmpty_(p.receiver) ? null : str_(p.receiver);
   var q = phpEmpty_(p.q) ? null : likeMatcher_(str_(p.q));
-  var rows = table_("movements").rows.filter(function (m) {
+  var rows = visibleMoves_().filter(function (m) {
     var t = typeMap[m.type_id];
     if (!t) return false;
     if (from !== null && !(m.moved_at >= from)) return false;
@@ -588,7 +720,7 @@ function queryHistory_(p) {
     if (kind !== null && m.kind !== kind) return false;
     if (receiver !== null && t.receiver !== receiver) return false;
     if (q && !(q(m.doc_no) || q(m.note) || q(m.actor) || q(m.location) || q(m.manifest_no) || q(m.vehicle) ||
-      q(t.code) || q(t.name))) return false;
+      q(m.method) || q(t.code) || q(t.name))) return false;
     return true;
   });
   return sortBy_(rows, byMovedDesc_).slice(0, 2000).map(function (m) {
@@ -600,16 +732,25 @@ function queryHistory_(p) {
   });
 }
 
+// "รายการ" is the movement type column. With a treatment token the export also
+// has the treatment rows and a "วิธีบำบัด / ระบบ" column; a treatment row has
+// no receiver (treated inside the plant, not shipped).
 function exportHistory_(items) {
-  var lines = [csvLine_(["เลขที่เอกสาร", "วันที่", "เวลา", "รายการ", "รหัสของเสีย", "ชื่อของเสีย", "รหัสการจัดการ",
+  var showTreat = treatOn_();
+  var head = ["เลขที่เอกสาร", "วันที่", "เวลา", "รายการ", "รหัสของเสีย", "ชื่อของเสีย", "รหัสการจัดการ",
     "ผู้รับดำเนินการ", "น้ำหนัก (กก.)", "ภาชนะ", "จำนวนภาชนะ", "สถานที่จัดเก็บ", "เลขที่ใบกำกับการขนส่ง",
-    "ทะเบียนรถ", "หมายเหตุ", "ผู้บันทึก"])];
+    "ทะเบียนรถ", "หมายเหตุ", "ผู้บันทึก"];
+  if (showTreat) head.push("วิธีบำบัด / ระบบ");
+  var lines = [csvLine_(head)];
   items.forEach(function (r) {
+    var treat = r.kind === "treat";
     // Codes keep their leading zeros in Excel (="080409"; validated digits only).
-    lines.push(csvLine_([r.doc_no, r.moved_at.slice(0, 10), r.moved_at.slice(11, 16), KIND_NAME[r.kind] || r.kind,
-      excelText_(r.code), csvText_(r.type_name), excelText_(r.mgmt_code), csvText_(r.receiver), Number(r.weight_kg).toFixed(2),
-      CONTAINERS[r.container] || r.container, r.containers, csvText_(r.location), csvText_(r.manifest_no),
-      csvText_(r.vehicle), csvText_(r.note), csvText_(r.actor)]));
+    var line = [r.doc_no, r.moved_at.slice(0, 10), r.moved_at.slice(11, 16), KIND_NAME[r.kind] || r.kind,
+      excelText_(r.code), csvText_(r.type_name), excelText_(r.mgmt_code), treat ? "บำบัดเองภายในโรงงาน" : csvText_(r.receiver),
+      Number(r.weight_kg).toFixed(2), CONTAINERS[r.container] || r.container, r.containers, csvText_(r.location),
+      csvText_(r.manifest_no), csvText_(r.vehicle), csvText_(r.note), csvText_(r.actor)];
+    if (showTreat) line.push(csvText_(r.method));
+    lines.push(csvLine_(line));
   });
   return { filename: "waste_history_" + stamp_() + ".csv", csv: lines.join("") };
 }
@@ -649,19 +790,23 @@ function exportLogs_(items) {
 
 /* ===================== write actions ===================== */
 
-// store / ship / opening. All three take: type_id, weight_kg, container,
-// containers, date, time, location, note; ship also manifest_no, vehicle.
+// store / ship / opening / treat. All take: type_id, weight_kg, container,
+// containers, date, time, location, note; ship also manifest_no, vehicle;
+// treat also method (วิธีบำบัด / ระบบ). Ship and treat may use an inactive
+// type (they only take out what is already in the plant).
 function actionMove_(kind, input) {
   var f = moveFields_(kind, input, null);
   var t = getType_(f.type_id);
-  if (kind !== "ship" && t.active !== 1) fail_("ประเภทของเสียนี้ถูกปิดใช้งานแล้ว");
+  if (!isOut_(kind) && t.active !== 1) fail_("ประเภทของเสียนี้ถูกปิดใช้งานแล้ว");
   var doc = nextNo_(PREFIX[kind], "movements", "doc_no");
   var row = insert_("movements", {
     doc_no: doc, kind: kind, type_id: f.type_id, weight_kg: f.weight_kg, container: f.container,
     containers: f.containers, location: f.location, manifest_no: f.manifest_no, vehicle: f.vehicle, note: f.note,
-    moved_at: f.moved_at, created_at: nowParts_().datetime, actor: REQ_.actor, updated_at: null, updated_by: ""
+    moved_at: f.moved_at, created_at: nowParts_().datetime, actor: REQ_.actor, updated_at: null, updated_by: "",
+    method: f.method
   });
-  validateLedger_(table_("movements").rows, (kind === "ship" ? "ส่งกำจัดเกินยอดคงเหลือ" : "บันทึกไม่ได้"), row);
+  var verb = kind === "ship" ? "ส่งกำจัดเกินยอดคงเหลือ" : kind === "treat" ? "บำบัดเกินยอดคงเหลือ" : "บันทึกไม่ได้";
+  validateLedger_(table_("movements").rows, verb, row);
   audit_("waste", kind, describeMove_(row), doc);
   var b = balances_()[f.type_id];
   return {
@@ -697,6 +842,7 @@ function moveFields_(kind, input, base) {
     location: text("location", 100, "สถานที่จัดเก็บ"),
     manifest_no: ship ? text("manifest_no", 60, "เลขที่ใบกำกับการขนส่ง") : "",
     vehicle: ship ? text("vehicle", 40, "ทะเบียนรถ") : "",
+    method: kind === "treat" ? text("method", 120, "วิธีบำบัด / ระบบ") : "",
     note: text("note", MAX_TEXT, "หมายเหตุ")
   };
 }
@@ -723,6 +869,7 @@ function describeMove_(m) {
     (m.location ? " · ที่เก็บ: " + m.location : "") +
     (m.manifest_no ? " · ใบกำกับ: " + m.manifest_no : "") +
     (m.vehicle ? " · ทะเบียนรถ: " + m.vehicle : "") +
+    (m.method ? " · วิธีบำบัด: " + m.method : "") +
     (m.note ? " · " + m.note : "");
 }
 
@@ -767,11 +914,11 @@ function actionMovementUpdate_(input) {
   var m = findMovement_(input);
   if (input.kind !== undefined && str_(input.kind) !== m.kind) fail_("เปลี่ยนชนิดรายการไม่ได้ — ให้ลบแล้วบันทึกใหม่");
   var f = moveFields_(m.kind, input, m);
-  var fields = ["type_id", "weight_kg", "container", "containers", "moved_at", "location", "manifest_no", "vehicle", "note"];
+  var fields = ["type_id", "weight_kg", "container", "containers", "moved_at", "location", "manifest_no", "vehicle", "method", "note"];
   var changes = [];
   fields.forEach(function (k) { if (f[k] !== m[k]) changes.push(k); });
   if (!changes.length) return { changed: false, message: "ไม่มีการเปลี่ยนแปลง" };
-  if (f.type_id !== m.type_id && m.kind !== "ship" && getType_(f.type_id).active !== 1) fail_("ประเภทของเสียนี้ถูกปิดใช้งานแล้ว");
+  if (f.type_id !== m.type_id && !isOut_(m.kind) && getType_(f.type_id).active !== 1) fail_("ประเภทของเสียนี้ถูกปิดใช้งานแล้ว");
   var copy = plain_(m);
   fields.forEach(function (k) { copy[k] = f[k]; });
   var moves = table_("movements").rows.map(function (r) { return r === m ? copy : r; });
