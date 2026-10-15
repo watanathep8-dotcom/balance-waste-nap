@@ -743,17 +743,30 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   assert.strictEqual(b.shipped_year_kg, 100);
   assert.strictEqual(b.permit_kg, 500);
   assert.strictEqual(b.quota_pct, 20);
-  assert.strictEqual(b.treated_kg, 150);
-  assert.strictEqual(b.treated_year_kg, 150);
-  assert.strictEqual(Math.round((b.in_kg - b.shipped_kg - b.treated_kg) * 100) / 100, b.balance_kg);
+  assert.ok(!("treated_kg" in b) && !("treated_year_kg" in b), "public balance: no treatment total");
   assert.strictEqual(boot().treat, false);
-  assert.strictEqual(tread(TV, "bootstrap").balance[12].treated_kg, 150);
+  const bt = tread(TV, "bootstrap").balance[12];
+  assert.strictEqual(bt.treated_kg, 150);
+  assert.strictEqual(bt.treated_year_kg, 150);
+  assert.strictEqual(Math.round((bt.in_kg - bt.shipped_kg - bt.treated_kg) * 100) / 100, bt.balance_kg);
+  assert.strictEqual(bt.balance_kg, b.balance_kg, "balances identical with and without a token");
+  assert.strictEqual(tread(TV, "bootstrap", { hideTreat: true }).balance[12].treated_kg, 150, "hideTreat hides rows only, not the totals");
   // public dashboard: the summary card (all = บำบัดเอง + ส่งกำจัด + คงเหลือ) and the monthly series
-  const d = okData(get("dashboard"));
+  const dPub = okData(get("dashboard"));
+  for (const k of ["treated_kg", "month_treat_kg", "year_treat_kg", "total_in_kg", "shipped_kg"]) assert.ok(!(k in dPub.kpi), "public kpi: " + k);
+  assert.ok(dPub.months.every(m => !("treat_kg" in m)), "public monthly series: no treat");
+  assert.ok(!/treat/i.test(JSON.stringify(dPub)), "public dashboard never mentions treatment");
+  const d = tread(TV, "dashboard");
+  assert.strictEqual(dPub.kpi.balance_kg, d.kpi.balance_kg);
+  assert.deepStrictEqual(dPub.months.map(m => [m.in_kg, m.out_kg]), d.months.map(m => [m.in_kg, m.out_kg]));
+  assert.deepStrictEqual(dPub.alerts, d.alerts);
+  assert.deepStrictEqual(dPub.receivers, d.receivers);
+  assert.strictEqual(tread(TA, "dashboard", { hideTreat: true }).kpi.treated_kg, d.kpi.treated_kg, "hideTreat does not hide the totals");
   assert.strictEqual(d.kpi.year_out_kg, d0.kpi.year_out_kg, "quota use unchanged by a treatment");
   assert.strictEqual(d.kpi.quota_pct, d0.kpi.quota_pct);
   assert.deepStrictEqual(d.receivers.map(x => x.shipped_year_kg), d0.receivers.map(x => x.shipped_year_kg));
-  assert.strictEqual(Math.round((d.kpi.treated_kg - d0.kpi.treated_kg) * 100) / 100, 150);
+  assert.strictEqual(dPub.kpi.year_out_kg, d0.kpi.year_out_kg);
+  assert.strictEqual(d.kpi.treated_kg >= 150, true);
   const k = d.kpi;
   assert.strictEqual(Math.round(k.total_in_kg * 100), Math.round(k.shipped_kg * 100) + Math.round(k.treated_kg * 100) + Math.round(k.balance_kg * 100));
   assert.ok(k.year_treat_kg >= 150 && k.month_treat_kg >= 0);
@@ -799,11 +812,20 @@ test("in-house rows: only with a password (any level); dashboard identical for e
     assert.ok(!/TR-|ภายในโรงงาน|ระบบ \/ วิธีการ/.test(c0), "CSV without in-house rows / column");
     assert.ok(!/TR-|ระบบบำบัดน้ำเสียภายในโรงงาน/.test(JSON.stringify(tread(tok, "bootstrap"))));
   }
-  // the dashboard is the same for everyone: totals yes, rows never
+  // the dashboard: totals only with a token (any level, same answer), rows never
   const dAnon = okData(get("dashboard"));
-  for (const tok of [TV, TS, TA]) assert.deepStrictEqual(tread(tok, "dashboard"), dAnon);
-  assert.ok(dAnon.kpi.treated_kg >= 150.5 && dAnon.months.some(m => m.treat_kg > 0));
-  assert.ok(!dAnon.recent.some(m => m.kind === "treat") && !/TR-/.test(JSON.stringify(dAnon)));
+  const dTok = tread(TV, "dashboard");
+  for (const tok of [TS, TA]) assert.deepStrictEqual(tread(tok, "dashboard"), dTok);
+  assert.ok(dTok.kpi.treated_kg >= 150.5 && dTok.months.some(m => m.treat_kg > 0));
+  assert.ok(!("treated_kg" in dAnon.kpi) && dAnon.months.every(m => !("treat_kg" in m)));
+  assert.ok(!dTok.recent.some(m => m.kind === "treat") && !/TR-/.test(JSON.stringify(dTok)) && !/TR-/.test(JSON.stringify(dAnon)));
+  // a bad / expired token is anonymous: no totals anywhere
+  assert.ok(!("treated_kg" in tread("a".repeat(64), "dashboard").kpi));
+  assert.ok(!("treated_kg" in tread("a".repeat(64), "bootstrap").balance[12]));
+  for (const a of ["bootstrap", "history", "export", "dashboard", "batch"]) {
+    const txt = JSON.stringify(a === "batch" ? okData(get("batch", { reads: JSON.stringify(["bootstrap", "dashboard", "history"]) })) : okData(get(a, a === "history" ? {} : a === "export" ? { type: "12" } : {})));
+    assert.ok(!/treated|treat_|total_in_kg|month_treat|TR-/.test(txt), "public " + a);
+  }
   // a client flag never widens access
   assert.strictEqual(tread(undefined, "bootstrap", { hideTreat: false, treat: true, role: "admin" }).treat, false);
   // view / staff / admin: the rows, the details and the CSV column
@@ -830,11 +852,12 @@ test("in-house rows: only with a password (any level); dashboard identical for e
   const w0 = okData(mv("store", 12, 1, { ...at(1), reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
   assert.strictEqual(w0.reads[0].treat, false);
   assert.strictEqual(w0.reads[0].role, null);
-  assert.strictEqual(w0.reads[0].balance[12].treated_kg, 150.5, "totals are public");
+  assert.ok(!("treated_kg" in w0.reads[0].balance[12]), "no totals without a token");
   assert.strictEqual(w0.reads[1].items.length, 0);
   const w1 = okData(mv("store", 12, 1, { ...at(1), token: TS, reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
   assert.strictEqual(w1.reads[0].treat, true);
   assert.strictEqual(w1.reads[0].role, "staff");
+  assert.strictEqual(w1.reads[0].balance[12].treated_kg, 150.5);
   assert.strictEqual(w1.reads[1].items.length, 2);
   // the dashboard "logs today" count never counts in-house audit rows (same for everyone)
   assert.strictEqual(okData(get("dashboard")).logsToday, tread(TA, "dashboard").logsToday);
@@ -1326,7 +1349,7 @@ test("no password: balance last_at never reveals the time of an in-house row (th
   assert.strictEqual(shown.last_at, at(1).date + " 09:00:00");
   assert.ok(!("last_vis_at" in shown));
   assert.strictEqual(hidden.balance_kg, shown.balance_kg); // the balance itself stays true
-  assert.strictEqual(hidden.treated_kg, shown.treated_kg); // and the in-house total is public
+  assert.ok(!("treated_kg" in hidden) && typeof shown.treated_kg === "number"); // the total only with a token
   assert.strictEqual(okData(get("batch", { reads: JSON.stringify(["bootstrap"]) })).results[0].balance[2].last_at, atStore);
 });
 
@@ -1406,7 +1429,8 @@ test("docs JS files parse; config shape; POST text/plain only; token in the body
   assert.ok(app.includes("const acts = m => `<div class=\"rec-acts\">"), "edit / delete buttons for everyone (password on click)");
   // a lower-level password never replaces a higher session; the extra token is logged out
   assert.ok(app.includes("if (!S.sess || ROLE_LV[r.role] >= ROLE_LV[S.sess.role]) {"));
-  // dashboard: the same for everyone, summary card always (labelled บำบัดเอง)
+  // dashboard: the summary card only when the server sent the totals (unlocked tab); unlock / lock redraws it
+  assert.ok(app.includes("sessionEnded(msg, noRoute)") && app.includes("if (TOTALS_PAGES.includes(currentPage())) route();") && app.includes("else if (!noRoute && TOTALS_PAGES.includes(currentPage())) route();"));
   assert.ok(app.includes("${k.treated_kg !== undefined ? treatSummary(k) : ''}"));
   assert.ok(!/treatSummary[^\n]*(can\(|treatOn\(\))/.test(app));
   // regression: the level painter must never match <body> (a fresh login hid the whole page)
@@ -1489,7 +1513,7 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(css.includes(".nav a.locked .tn-lock{display:inline-block}") && css.includes(".unlock-card{") && css.includes(".locked-page{") && css.includes(".treat-bar{") && css.includes(".role-tag.r-admin"));
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
   // cache busters bumped with this change
-  assert.ok(html.includes("assets/app.js?v=7") && html.includes("assets/style.css?v=5"));
+  assert.ok(html.includes("assets/app.js?v=8") && html.includes("assets/style.css?v=5"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });

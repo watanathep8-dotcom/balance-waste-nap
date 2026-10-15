@@ -81,8 +81,8 @@ const CLIENT_ID = (() => {
   }
   return id;
 })();
-/* รายการข้อมูลภายใน (TR-) แสดงเฉพาะหน้า “ข้อมูลภายใน” ที่ปลดล็อกแล้ว — หน้าอื่นขอให้เซิร์ฟเวอร์ซ่อน (หน้าเหมือนกันทุกคน)
-   ยอดรวม “บำบัดเอง” บนแดชบอร์ด / คงเหลือ เป็นข้อมูลสาธารณะ */
+/* รายการข้อมูลภายใน (TR-) แสดงเฉพาะหน้า “ข้อมูลภายใน” ที่ปลดล็อกแล้ว — หน้าอื่นขอให้เซิร์ฟเวอร์ซ่อน
+   ยอดรวม “บำบัดเอง” (แดชบอร์ด / คงเหลือ) เซิร์ฟเวอร์ส่งให้เฉพาะคำขอที่มี token — ยังไม่ปลดล็อก = ไม่มีการ์ดนี้ */
 const treatOn = () => can('viewer') && currentPage() === 'treat';
 
 // Actions that change data: the user's name (top-right) must be set first.
@@ -167,6 +167,7 @@ function askUnlock(need = 'viewer', why = '') {
         }
         toast(`ปลดล็อกแล้ว — สิทธิ์: ${ROLE_TH[S.sess.role]}`, 'info');
         done(true);
+        if (TOTALS_PAGES.includes(currentPage())) route(); // the totals appear at once
       } catch (err) {
         errEl.textContent = err.message; inp.value = ''; inp.focus(); idle();
       }
@@ -176,7 +177,8 @@ function askUnlock(need = 'viewer', why = '') {
   return S.unlockPending;
 }
 // Session gone (locked, expired, password changed): back to the open (public) view.
-function sessionEnded(msg) {
+const TOTALS_PAGES = ['dashboard', 'balance']; // pages whose treatment totals depend on the session
+function sessionEnded(msg, noRoute) {
   if (!S.sess) return;
   S.sess = null;
   ss('del', SESS_KEY);
@@ -184,6 +186,7 @@ function sessionEnded(msg) {
   paintRole();
   if (msg) toast(msg, 'info');
   if (pageNeed()) { closeModal(); route(); }
+  else if (!noRoute && TOTALS_PAGES.includes(currentPage())) route(); // the totals disappear at once
 }
 function lockNow() {
   const tok = S.sess && S.sess.t;
@@ -215,7 +218,7 @@ function applyBoot(j) {
   // the server is the authority on the level of this session (null: no / expired session)
   if (S.sess && j.role === null) {
     const p = currentPage();
-    sessionEnded('หมดเวลาการปลดล็อก (หรือรหัสผ่านถูกเปลี่ยน) — กรุณาใส่รหัสผ่านใหม่');
+    sessionEnded('หมดเวลาการปลดล็อก (หรือรหัสผ่านถูกเปลี่ยน) — กรุณาใส่รหัสผ่านใหม่', true);
     return !pageNeed(p);
   }
   if (S.sess && j.role && j.role !== S.sess.role && ROLE_LV[j.role]) {
@@ -488,7 +491,7 @@ function lockedPage(p, need) {
   view.innerHTML = `<div class="card locked-page">
     ${treat ? '<div class="treat-ic lock-ic" aria-hidden="true"><span class="tr"></span><span class="tc"><i class="fa-solid fa-lock"></i></span></div>' : ecoLogo('lock-ic')}
     <h2>${esc(PAGES[p][0])} <span class="tag lk-tag"><i class="fa-solid fa-lock"></i>ล็อกอยู่</span></h2>
-    <p>${treat ? (need === 'staff' ? 'การบันทึกข้อมูลภายในต้องใช้รหัสผ่าน “พนักงานกรอกข้อมูล” หรือ “ผู้ดูแลระบบ”' : 'เมนูนี้ต้องใส่รหัสผ่านก่อนเปิด — แดชบอร์ดและยอดรวม “บำบัดเอง” ดูได้ทุกคนโดยไม่ต้องใช้รหัส')
+    <p>${treat ? (need === 'staff' ? 'การบันทึกข้อมูลภายในต้องใช้รหัสผ่าน “พนักงานกรอกข้อมูล” หรือ “ผู้ดูแลระบบ”' : 'เมนูนี้ต้องใส่รหัสผ่านก่อนเปิด — ยอดรวม “บำบัดเอง” บนแดชบอร์ดจะแสดงหลังปลดล็อกเท่านั้น')
       : 'หน้านี้ต้องใช้รหัสผ่าน “ผู้ดูแลระบบ”'}${S.sess ? `<br><small>สิทธิ์ปัจจุบันของแท็บนี้: <b>${ROLE_TH[S.sess.role]}</b></small>` : ''}</p>
     <div class="lock-levels">${Object.keys(ROLE_LV).map(r => `<div class="ll r-${r} ${ROLE_LV[r] >= ROLE_LV[need] ? '' : 'dim'}"><i class="fa-solid ${ROLE_IC[r]}"></i><b>${ROLE_TH[r]}</b><small>${ROLE_CAN[r]}</small></div>`).join('')}</div>
     <div class="modal-acts" style="justify-content:center"><a class="btn btn-ghost" href="${treat && need === 'staff' && can('viewer') ? '#treat' : '#dashboard'}"><i class="fa-solid fa-arrow-left"></i>${treat && need === 'staff' && can('viewer') ? 'กลับไปรายการ' : 'กลับแดชบอร์ด'}</a>
@@ -641,7 +644,7 @@ async function dashboard(d) {
   ${k.treated_kg !== undefined ? treatSummary(k) : ''}
 
   <div class="grid g-2 mt">
-    <div class="card"><h3><i class="fa-solid fa-chart-column"></i>ปริมาณจัดเก็บ / ส่งกำจัด / บำบัดเอง 12 เดือน<span class="sub">ตัน</span></h3><div class="chart-box"><canvas id="cMonths"></canvas></div></div>
+    <div class="card"><h3><i class="fa-solid fa-chart-column"></i>ปริมาณจัดเก็บ / ส่งกำจัด${k.treated_kg !== undefined ? ' / บำบัดเอง' : ''} 12 เดือน<span class="sub">ตัน</span></h3><div class="chart-box"><canvas id="cMonths"></canvas></div></div>
     <div class="card"><h3><i class="fa-solid fa-gauge-high"></i>โควตารวมปีนี้<span class="sub">เทียบปริมาณที่ได้รับอนุญาต</span></h3>
       <div class="gauge-wrap">${needleGauge(k.quota_pct || 0)}<div class="gauge-val"><span data-count="${k.quota_pct || 0}" data-dec="1">0</span><small>%</small></div>
       <div class="gauge-sub">ส่งกำจัดแล้ว ${fmtT(k.year_out_kg)} ตัน จาก ${fmtT(k.permit_kg)} ตัน<br><span class="tag lv-${lv}">${lvName[lv]}</span></div></div></div>
@@ -674,7 +677,7 @@ async function dashboard(d) {
   }));
   drawDashCharts(d);
 }
-/* ของเสียทั้งหมด = บำบัดเอง + ส่งกำจัด + คงเหลือ (สะสม) — ทุกคนเห็นเหมือนกัน (ยอดรวมเท่านั้น ไม่มีรายการ TR-) */
+/* ของเสียทั้งหมด = บำบัดเอง + ส่งกำจัด + คงเหลือ (สะสม) — เฉพาะแท็บที่ปลดล็อกแล้ว (ยอดรวมเท่านั้น ไม่มีรายการ TR-) */
 function treatSummary(k) {
   const tot = k.total_in_kg || 0, pc = v => tot > 0 ? Math.max(0, v / tot * 100) : 0;
   const parts = [
@@ -933,7 +936,7 @@ function txForm(page) {
 /* ================= BALANCE ================= */
 function balance() {
   const days = S.limits.storageAlertDays || 90;
-  // per-type in-house totals (บำบัดเอง): public, like the dashboard
+  // per-type in-house totals (บำบัดเอง): only when the server sent them (unlocked tab)
   const showT = S.types.some(t => balOf(t.id).treated_kg !== undefined);
   let filter = 'all';
   const recv = receivers().map(r => {

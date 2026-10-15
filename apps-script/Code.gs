@@ -48,7 +48,8 @@
  * leaves the in-plant balance exactly like a shipment (same replay / container
  * checks) but is NOT a shipment: the สก.2 quota (quota %, receiver quotas)
  * counts "ship" only. Aggregate totals (per-type treated_kg, dashboard KPIs and
- * the monthly series) are public and the dashboard is the same for everyone.
+ * the monthly series) are sent only to a request with a valid token of any
+ * level (aggOn_; hideTreat does not matter); anonymous requests get none.
  * The individual TR- rows (date, method, note, recorder: history, CSV, the
  * time of the last movement) are sent only to a request with a valid session
  * of any level that does not ask to hide them (hideTreat). Recording "treat"
@@ -491,6 +492,13 @@ function treatOn_() {
   return Boolean(REQ_ && REQ_.treat);
 }
 
+// True while the current request carries a valid session of any level: only
+// then are the AGGREGATE treatment totals (treated_kg, monthly treat series,
+// total waste) sent. Independent of hideTreat (that only hides the TR- rows).
+function aggOn_() {
+  return Boolean(REQ_ && REQ_.role);
+}
+
 function isOut_(kind) {
   return OUT_KINDS.indexOf(kind) !== -1;
 }
@@ -543,8 +551,8 @@ function sortedTypes_() {
 
 // Per waste type: totals, containers in storage, this year's shipments vs the
 // permitted quantity and the date of the oldest lot still in storage (FIFO).
-// treated_kg / treated_year_kg (in-house totals) are public; balance_kg is
-// always the true in-plant balance (see publicBalances_ for last_at).
+// treated_kg / treated_year_kg (in-house totals) go only to a session (see
+// publicBalances_); balance_kg is always the true in-plant balance (see publicBalances_ for last_at).
 function balances_() {
   var now = nowParts_();
   var year = now.date.slice(0, 4);
@@ -619,9 +627,11 @@ function balances_() {
 // in-house rows last_at never shows the time of one (row-level detail).
 function publicBalances_(bal) {
   var showTreat = treatOn_();
+  var showAgg = aggOn_();
   var out = {};
   Object.keys(bal).forEach(function (id) {
     var o = plain_(bal[id]);
+    if (!showAgg) { delete o.treated_kg; delete o.treated_year_kg; }
     if (!showTreat) o.last_at = o.last_vis_at;
     delete o.last_vis_at;
     out[id] = o;
@@ -686,7 +696,7 @@ function typeLabel_(id) {
 
 function actionBootstrap_() {
   var now = nowParts_();
-  var core = cachedDerived_("boot2_" + modeTag_() + now.date, ["waste_types", "movements"], function () {
+  var core = cachedDerived_("boot3_" + modeTag_() + now.date, ["waste_types", "movements"], function () {
     return { types: sortedTypes_().map(plain_), balance: publicBalances_(balances_()) };
   });
   return {
@@ -704,7 +714,7 @@ function actionBootstrap_() {
 
 // Cache-key part for derived reads that differ by treatment visibility.
 function modeTag_() {
-  return treatOn_() ? "t_" : "";
+  return (aggOn_() ? "a" : "") + (treatOn_() ? "t_" : "_");
 }
 
 // Movements a request may see (in-house "treat" rows only with access, see treatOn_).
@@ -717,10 +727,11 @@ function actionDashboard_() {
   var now = nowParts_();
   var month = now.date.slice(0, 7);
   var year = now.date.slice(0, 4);
-  // The same for everyone (with or without a session): in-house totals and the
-  // monthly series are public, individual in-house rows never appear here.
-  // ("2" in the cache ids: a new shape, never reuse a cached answer of the previous version)
-  var core = cachedDerived_("dash2_" + now.date, ["waste_types", "movements", "audit_logs"], function () {
+  // Treatment aggregates (kpi treated / total / month / year, monthly treat
+  // series) only for a session (aggOn_); individual in-house rows never appear.
+  // ("4" in the cache ids: a new shape, never reuse a cached answer of the previous version)
+  var agg = aggOn_();
+  var core = cachedDerived_("dash4_" + (agg ? "a" : "p") + now.date, ["waste_types", "movements", "audit_logs"], function () {
     var types = sortedTypes_();
     var bal = balances_();
     var moves = table_("movements").rows;
@@ -790,18 +801,22 @@ function actionDashboard_() {
         year_out_kg: kgOf_(totalYear),
         permit_kg: kgOf_(totalPermit),
         quota_pct: totalPermit > 0 ? Math.round(totalYear / totalPermit * 1000) / 10 : null,
-        moves: publicMoves.length,
-        // All-time totals that add up: in = shipped + treated + balance.
-        total_in_kg: kgOf_(totalIn),
-        shipped_kg: kgOf_(totalShip),
-        treated_kg: kgOf_(totalTreat),
-        month_treat_kg: kgOf_(monthTreat),
-        year_treat_kg: kgOf_(yearTreat)
+        moves: publicMoves.length
     };
+    if (agg) {
+      // All-time totals that add up: in = shipped + treated + balance.
+      kpi.total_in_kg = kgOf_(totalIn);
+      kpi.shipped_kg = kgOf_(totalShip);
+      kpi.treated_kg = kgOf_(totalTreat);
+      kpi.month_treat_kg = kgOf_(monthTreat);
+      kpi.year_treat_kg = kgOf_(yearTreat);
+    }
     return {
       kpi: kpi,
       months: months.map(function (m) {
-        return { ym: m.ym, in_kg: kgOf_(m.in_c), out_kg: kgOf_(m.out_c), treat_kg: kgOf_(m.treat_c) };
+        var o = { ym: m.ym, in_kg: kgOf_(m.in_c), out_kg: kgOf_(m.out_c) };
+        if (agg) o.treat_kg = kgOf_(m.treat_c);
+        return o;
       }),
       containers: containers,
       receivers: recvOrder.map(function (k) {
