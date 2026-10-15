@@ -14,7 +14,8 @@ const sandbox = { require, console, __dirname: path.join(ROOT, "test"), module: 
 vm.runInNewContext(head + "\n;this.createGas = createGas; this.loadCode = loadCode;", sandbox);
 const { gas, state } = sandbox.createGas();
 const ctx = sandbox.loadCode(gas);
-state.props.WASTE_RESET_PASSWORD = "dev-reset"; // dev-only password of the in-memory mock
+// dev-only passwords of the in-memory mock (never used anywhere else)
+Object.assign(state.props, { WASTE_VIEW_PASSWORD: "dev-view", WASTE_STAFF_PASSWORD: "dev-staff", WASTE_RESET_PASSWORD: "dev-reset" });
 ctx.setupSystem();
 
 const args = process.argv.slice(2);
@@ -24,7 +25,16 @@ if (args.includes("--demo")) seedDemo();
 function seedDemo() {
   let seed = 7;
   const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-  const post = body => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(Object.assign({ actor: "ผู้ทดสอบ (ตัวอย่าง)" }, body)) } }).getContent());
+  const call = body => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(body) } }).getContent());
+  const token = call({ action: "login", password: state.props.WASTE_RESET_PASSWORD }).data.token;
+  // weights: kg here, sent as tons (weight_t) like the page does
+  const T = kg => (Math.round(Number(kg) * 100) / 100000).toFixed(5);
+  const post = body => {
+    const b = Object.assign({ actor: "ผู้ทดสอบ (ตัวอย่าง)", token }, body);
+    if (b.weight_kg !== undefined) { b.weight_t = T(b.weight_kg); delete b.weight_kg; }
+    return call(b);
+  };
+  const read = action => call({ action, token }).data;
   const p2 = n => String(n).padStart(2, "0");
   const now = new Date(Date.now() + 7 * 3600e3);
   const day = (back, h) => { const d = new Date(now.getTime() - back * 86400e3); return { date: `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`, time: `${p2(h)}:${p2(Math.floor(rnd() * 59))}` }; };
@@ -33,8 +43,6 @@ function seedDemo() {
     [7, 6, "drum200"], [8, 10, "bigbag"], [9, 140, "bigbag"], [10, 150, "bigbag"], [11, 420, "ibc"], [13, 900, "ibc"]];
   post({ action: "opening", type_id: 13, weight_kg: "54000", container: "ibc", containers: "54", ...day(330, 8), note: "ตัวอย่าง" });
   post({ action: "opening", type_id: 11, weight_kg: "25000", container: "ibc", containers: "25", ...day(330, 8), note: "ตัวอย่าง" });
-  // in-house treatment (บำบัดเองภายใน) needs the treatment token of the mock
-  const treatToken = post({ action: "treat_unlock", resetPassword: state.props.WASTE_RESET_PASSWORD }).data.token;
   for (let back = 320; back >= 0; back -= 9) {
     plan.forEach(([id, kg, c]) => {
       if (rnd() < 0.45) {
@@ -44,7 +52,7 @@ function seedDemo() {
       }
     });
     if (back % 27 < 9) {
-      const boot = JSON.parse(ctx.doGet({ parameter: { action: "bootstrap" } }).getContent()).data;
+      const boot = read("bootstrap");
       plan.forEach(([id, , c]) => {
         const b = boot.balance[id];
         const n = b.containers[c];
@@ -56,10 +64,10 @@ function seedDemo() {
       });
     }
     if (back % 27 >= 18 && rnd() < 0.7) {
-      // part of the machine wash water goes to the plant's own wastewater system
-      const b = JSON.parse(ctx.doGet({ parameter: { action: "bootstrap" } }).getContent()).data.balance[13];
+      // in-house data (ข้อมูลภายใน): part of the machine wash water goes to the plant's own system
+      const b = read("bootstrap").balance[13];
       const take = Math.min(b.containers.ibc, 1 + Math.floor(rnd() * 2));
-      if (take > 0) post({ action: "treat", type_id: 13, weight_kg: String(Math.min(take * 1000, b.balance_kg)), container: "ibc", containers: String(take), method: "ระบบบำบัดน้ำเสียภายในโรงงาน", treatToken, ...day(back, 11) });
+      if (take > 0) post({ action: "treat", type_id: 13, weight_kg: String(Math.min(take * 1000, b.balance_kg)), container: "ibc", containers: String(take), method: "ระบบบำบัดน้ำเสียภายในโรงงาน", ...day(back, 11) });
     }
   }
 }

@@ -9,15 +9,23 @@
  * and stores the spreadsheet ID in Script Properties (WASTE_SPREADSHEET_ID).
  * Then deploy as a web app (Execute as: me, Who has access: Anyone).
  *
- * No login: reads and the normal writes (store, ship, opening) need no
- * password. The name typed in the top-right of the page is sent as "actor" and
- * recorded on every movement and audit_logs row ("ผู้บันทึก").
- *
- * Script property WASTE_RESET_PASSWORD protects, with one lockout counter
- * (10 wrong / 15 min): reset_data (wipes movements and audit_logs; waste
- * types are kept), editing / deleting movements (movement_update,
- * movement_delete), editing / adding waste types (type_save) and reading the
- * audit log (logs, logs_export). The password is never in the source.
+ * Login (3 access levels). Every API call except login / logout carries a
+ * session token. The passwords are Script Properties only (never in the source):
+ *   WASTE_VIEW_PASSWORD   viewer  "เข้าดูได้อย่างเดียว": every read (bootstrap,
+ *                         dashboard, history, export, batch)
+ *   WASTE_STAFF_PASSWORD  staff   "พนักงานกรอกข้อมูล": viewer + store / opening / ship
+ *   WASTE_RESET_PASSWORD  admin   "ผู้ดูแลระบบ": everything (edit / delete movements,
+ *                         waste types, audit log, reset_data, ข้อมูลภายใน)
+ * An unset property means that level cannot log in. login compares the password
+ * with all three (SHA-256 digests, constant time, highest role wins) and issues
+ * a random token kept in CacheService (SESSION_TTL = 12 h absolute; the cache
+ * entry is renewed while in use because CacheService keeps a value <= 6 h).
+ * Changing / removing a password ends the sessions of that level. Wrong
+ * passwords: 1 s delay each; lockout per client (5 / 15 min) and global
+ * (30 / 15 min). The server checks the role on EVERY action (ACTION_ROLE).
+ * reset_data also needs the admin password typed again (same lockout).
+ * The name typed in the top-right of the page is sent as "actor" and recorded
+ * on every movement and audit_logs row ("ผู้บันทึก"); writes need it.
  *
  * Ledger integrity: every write that changes movements (ship, edit, delete,
  * also store/opening) is checked by replaying ALL movements in time order
@@ -25,38 +33,57 @@
  * every (waste type, container) pair must never go below zero at any moment.
  * Nothing is written unless the replay passes.
  *
- * In-house treatment (kind "treat", บำบัดเองภายใน): waste treated inside the
- * plant (e.g. the plant's own wastewater treatment system). It leaves the
- * in-plant balance exactly like a shipment (same replay / container checks) but
- * is NOT a shipment: the สก.2 quota (quota %, receiver quotas) counts "ship"
- * only. Treatment data is hidden by default: the read APIs leave out treatment
- * rows and totals (balances stay true: balance = in - shipped - treated) unless
- * the request carries a treatment token (treatToken, POST only). treat_unlock
- * (WASTE_RESET_PASSWORD, same lockout) issues a token kept in CacheService for
- * TREAT_TOKEN_TTL seconds; treat_lock drops it. Writing "treat" needs a token.
- * Every treatment row is still in the movements sheet and in audit_logs.
+ * Units: the sheet stores kilograms (weight_kg, 0.01 kg precision; existing
+ * rows are kg). The page sends weight_t (tons, up to 5 decimals = 0.01 kg;
+ * normally 3 = 1 kg) and the server converts exactly: kg = round(t * 100000) / 100.
+ * API numbers stay *_kg; every text the server writes (messages, audit log,
+ * CSV) shows tons.
+ *
+ * In-house data (kind "treat", ข้อมูลภายใน): stock handled inside the plant
+ * (e.g. the plant's own wastewater system). It leaves the in-plant balance
+ * exactly like a shipment (same replay / container checks) but is NOT a
+ * shipment: the สก.2 quota (quota %, receiver quotas) counts "ship" only. Only
+ * admin sessions ever receive it (rows, totals, CSV column); every other read
+ * leaves it out (balances stay true: balance = in - shipped - treat). An admin
+ * page may also ask to hide it (hideTreat). Writing "treat" needs admin. Every
+ * row is still in the movements sheet and in audit_logs.
  *
  * Optional: run installKeepWarmTrigger() once from the editor; a 10-minute
  * trigger then runs keepWarm() (read-only) to keep the read cache hot.
  *
- * Transport:
- *   GET  ?action=<read action>&...params -> {ok:true,data} | {ok:false,error}
- *   POST text/plain JSON {action, actor, ...fields}  (no CORS preflight)
+ * Transport (no CORS preflight): POST text/plain JSON
+ *   {action, token, actor, ...fields} -> {ok:true,data} | {ok:false,error,code}
+ *   code AUTH_REQUIRED (no / expired session) or FORBIDDEN (role too low).
+ *   GET without an action answers the service info only (tokens never in URLs).
  */
 
 var SPREADSHEET_ID_PROPERTY = "WASTE_SPREADSHEET_ID";
 var SPREADSHEET_NAME = "Balance Waste Database";
 
-// Reset password (Script Property only) with its own lockout counter.
+// Access levels. Passwords: Script Properties only (see the header comment).
 var RESET_ACTION = "reset_data";
 var RESET_PASSWORD_PROPERTY = "WASTE_RESET_PASSWORD";
-var RESET_FAIL_CACHE_KEY = "WASTE_RESET_FAILURES";
-var PASSWORD_MAX_FAILURES = 10;
+var ROLE_PROPERTY = { viewer: "WASTE_VIEW_PASSWORD", staff: "WASTE_STAFF_PASSWORD", admin: RESET_PASSWORD_PROPERTY };
+var ROLE_LEVEL = { viewer: 1, staff: 2, admin: 3 };
+var ROLE_NAME = { viewer: "เข้าดูได้อย่างเดียว", staff: "พนักงานกรอกข้อมูล", admin: "ผู้ดูแลระบบ" };
+var ROLE_ORDER = ["admin", "staff", "viewer"]; // the same password set for two levels: the higher one wins
+// The lowest role allowed to run each action (checked on every request).
+var ACTION_ROLE = {
+  bootstrap: "viewer", dashboard: "viewer", history: "viewer", "export": "viewer", batch: "viewer",
+  store: "staff", opening: "staff", ship: "staff",
+  treat: "admin", movement_update: "admin", movement_delete: "admin", type_save: "admin",
+  reset_data: "admin", logs: "admin", logs_export: "admin"
+};
+var SESSION_PREFIX = "WASTE_SS_";
+var SESSION_TTL = 43200;          // 12 h absolute session length
+var CACHE_MAX_TTL = 21600;        // CacheService keeps a value at most 6 h
+var SESSION_RENEW_MS = 3600000;   // re-put the session entry at most once an hour while in use
+var FAIL_GLOBAL_KEY = "WASTE_LOGIN_FAILURES";
+var FAIL_CLIENT_PREFIX = "WASTE_LF_";
+var CLIENT_MAX_FAILURES = 5;      // wrong passwords per browser (client id) per 15 min
+var GLOBAL_MAX_FAILURES = 30;     // wrong passwords from everyone per 15 min
 var PASSWORD_LOCK_SECONDS = 900;
 var RESET_TABLES = ["movements", "audit_logs"]; // waste_types are kept
-var RESET_PASSWORD_ACTIONS = [RESET_ACTION, "movement_update", "movement_delete", "type_save"];
-// Reading the audit log also needs the reset password (POST only).
-var LOG_ACTIONS = ["logs", "logs_export"];
 
 // Asia/Bangkok has no daylight saving time: fixed +07:00.
 var TZ_OFFSET_MS = 7 * 60 * 60 * 1000;
@@ -70,19 +97,19 @@ var COMPANY = {
 
 var CONTAINERS = { drum200: "ถัง 200 ลิตร", ibc: "IBC", bigbag: "Bigbag" };
 var CONTAINER_KEYS = ["drum200", "ibc", "bigbag"];
-var KIND_NAME = { store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด / นำออก", opening: "ยอดยกมา", treat: "บำบัดเองภายใน" };
+var KIND_NAME = { store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด / นำออก", opening: "ยอดยกมา", treat: "ข้อมูลภายใน" };
 var KINDS = ["store", "ship", "opening", "treat"];
 var OUT_KINDS = ["ship", "treat"]; // leave the in-plant balance
 var PREFIX = { store: "ST", ship: "SH", opening: "OB", treat: "TR" };
 var ACT_NAME = {
-  store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด", opening: "ยอดยกมา", treat: "บำบัดเองภายใน",
+  store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด", opening: "ยอดยกมา", treat: "บันทึกข้อมูลภายใน",
   movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ", type_save: "ตั้งค่าประเภทของเสีย"
 };
 var LOG_CAT_NAME = { waste: "ของเสีย", edit: "แก้ไข / ลบ", setting: "ตั้งค่า", warn: "ถูกปฏิเสธ" };
 
 var QUOTA_WARN_PCT = 80;        // >= 80 % of the permitted quantity: warning
 var STORAGE_ALERT_DAYS = 90;    // oldest stored lot (FIFO) older than this: alert
-var MAX_WEIGHT_KG = 1000000;    // one movement
+var MAX_WEIGHT_KG = 1000000;    // one movement (1,000 t)
 var MAX_PERMIT_TONS = 100000;
 var FUTURE_SLACK_MS = 10 * 60 * 1000; // client clock may be a few minutes ahead
 
@@ -130,7 +157,7 @@ var SEED_TYPES = [
   ["161001", "น้ำล้างเครื่องจักร (น้ำแรก)", 40, "065", "10103300225380", RCV_GENCO, "fa-faucet-drip", "#14B8A6"]
 ];
 
-var READ_ACTIONS = ["bootstrap", "dashboard", "history", "export", "logs", "logs_export", "batch"];
+var READ_ACTIONS = ["bootstrap", "dashboard", "history", "export", "logs", "logs_export", "batch"]; // POST only (token)
 // "batch": several reads in one request; writes accept the same optional
 // "reads" list and return the post-write results as data.reads.
 var BATCH_ACTIONS = ["bootstrap", "dashboard", "history"];
@@ -149,28 +176,23 @@ var KEEP_WARM_TTL = 900;
 var KEEP_WARM_MINUTES = 10;
 var RC_CHUNK = 30000;
 var RC_MAX_CHUNKS = 30;
-var WRITE_ACTIONS = ["store", "ship", "opening", "treat"];
-var POST_ONLY_ACTIONS = ["verifyResetPassword", "treat_unlock", "treat_lock"].concat(WRITE_ACTIONS, RESET_PASSWORD_ACTIONS, LOG_ACTIONS);
-
-// Treatment visibility token (see the header comment). CacheService keeps a
-// value at most 6 hours, so that is the session length.
-var TREAT_TOKEN_PREFIX = "WASTE_TT_";
-var TREAT_TOKEN_TTL = 21600;
+var WRITE_ACTIONS = ["store", "ship", "opening", "treat", RESET_ACTION, "movement_update", "movement_delete", "type_save"];
 
 var MAX_PERSON = 100;
 var MAX_TEXT = 255;
 
 /* ===================== web app entry points ===================== */
 
+// Reads carry a session token, so they are POST only (a token never goes into a URL).
 function doGet(e) {
   var params = (e && e.parameter) || {};
   var action = String(params.action || "");
   try {
     if (!action) return jsonResponse_({ ok: true, data: { service: "Balance Waste API" } });
-    if (POST_ONLY_ACTIONS.indexOf(action) !== -1) throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
-    if (READ_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
-    resetRequest_("");
-    return jsonResponse_({ ok: true, data: runRead_(action, params) });
+    if (action === "login" || action === "logout" || Object.prototype.hasOwnProperty.call(ACTION_ROLE, action)) {
+      throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
+    }
+    fail_("Unknown action");
   } catch (error) {
     return errorResponse_(error);
   }
@@ -187,34 +209,30 @@ function doPost(e) {
   var action = String(payload.action || "");
 
   var reads = null;
+  var sess;
   try {
-    if (action === "verifyResetPassword") {
-      return jsonResponse_({ ok: true, data: verifyResetPassword(payload.resetPassword) });
-    }
-    if (action === "treat_lock") return jsonResponse_({ ok: true, data: treatLock_(payload.treatToken) });
-    if (action === "treat_unlock") {
-      assertResetPassword_(payload.resetPassword);
-      return runWrite_(action, payload, null);
-    }
+    if (action === "login") return jsonResponse_({ ok: true, data: actionLogin_(payload) });
+    if (action === "logout") return jsonResponse_({ ok: true, data: actionLogout_(payload.token) });
+    if (!Object.prototype.hasOwnProperty.call(ACTION_ROLE, action)) fail_("Unknown action");
+    // Server-side access control on every action (never trusts the page).
+    sess = requireRole_(payload.token, ACTION_ROLE[action]);
+    sess.treat = sess.role === "admin" && !phpTruthy_(payload.hideTreat);
     if (READ_ACTIONS.indexOf(action) !== -1) {
-      if (LOG_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
       resetRequest_("");
-      REQ_.treat = treatTokenOk_(payload.treatToken);
+      REQ_.role = sess.role;
+      REQ_.treat = sess.treat;
       return jsonResponse_({ ok: true, data: runRead_(action, payload) });
     }
-    if (WRITE_ACTIONS.indexOf(action) === -1 && RESET_PASSWORD_ACTIONS.indexOf(action) === -1) fail_("Unknown action");
     if (payload.reads != null && payload.reads !== "") reads = parseReads_(payload.reads);
     // Every change must say who made it (name set in the page header).
     if (!actorIn_(payload)) fail_("กรุณาระบุชื่อผู้ใช้งาน (มุมขวาบน) ก่อนบันทึก", "NAME_REQUIRED");
-    if (action === "treat" && !treatTokenOk_(payload.treatToken)) {
-      fail_("โหมดบำบัดเองภายในถูกล็อก กรุณาปลดล็อกด้วยรหัสผ่านผู้ดูแลก่อน", "TREAT_LOCKED");
-    }
-    // Checked before taking the lock so guessing (1 s delay) never blocks writers.
-    if (RESET_PASSWORD_ACTIONS.indexOf(action) !== -1) assertResetPassword_(payload.resetPassword);
+    // Wiping all data: the admin password is typed again. Checked before taking
+    // the lock so guessing (1 s delay) never blocks writers.
+    if (action === RESET_ACTION) assertResetPassword_(payload.resetPassword, payload.client);
   } catch (error) {
     return errorResponse_(error);
   }
-  return runWrite_(action, payload, reads);
+  return runWrite_(action, payload, reads, sess);
 }
 
 function actorIn_(input) {
@@ -222,7 +240,7 @@ function actorIn_(input) {
   return mbSubstr_(phpTrim_(v !== null && typeof v === "object" ? "" : str_(v)), 0, MAX_PERSON);
 }
 
-function runWrite_(action, input, reads) {
+function runWrite_(action, input, reads, sess) {
   var lock = LockService.getScriptLock();
   try {
     lock.waitLock(30000);
@@ -231,10 +249,13 @@ function runWrite_(action, input, reads) {
   }
   var actor = actorIn_(input);
   var result;
-  var treat = treatTokenOk_(input.treatToken);
-  try {
+  var start = function () {
     resetRequest_(actor);
-    REQ_.treat = treat;
+    REQ_.role = sess.role;
+    REQ_.treat = sess.treat;
+  };
+  try {
+    start();
     try {
       result = handleWrite_(action, input);
       flush_();
@@ -244,8 +265,7 @@ function runWrite_(action, input, reads) {
       var actName = ACT_NAME[action];
       if (actName && action !== RESET_ACTION) {
         try {
-          resetRequest_(actor);
-          REQ_.treat = treat;
+          start();
           audit_("warn", action, "ปฏิเสธ" + actName + ": " + errorMessage_(error), "");
           flush_();
         } catch (ignored) {}
@@ -294,34 +314,32 @@ function afterReads_(reads) {
   }
 }
 
-/* ===================== reset password ===================== */
+/* ===================== login / sessions / passwords ===================== */
 
-function verifyResetPassword(password) {
-  assertResetPassword_(password);
-  return { valid: true };
+function cache_() {
+  return CacheService.getScriptCache();
 }
 
-function assertResetPassword_(password) {
-  checkPassword_(password, RESET_PASSWORD_PROPERTY, RESET_FAIL_CACHE_KEY,
-    "ยังไม่ได้ตั้งรหัสผ่านผู้ดูแลใน Script Properties (" + RESET_PASSWORD_PROPERTY +
-    ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อน");
+// SHA-256 of a text as signed bytes (Apps Script digest format).
+function digest_(text) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(text), Utilities.Charset.UTF_8);
 }
 
-// Property must be set; >10 wrong attempts per 15 min locks the check; every
-// wrong attempt costs 1 s.
-function checkPassword_(password, property, failKey, missingMessage) {
-  var expected = PropertiesService.getScriptProperties().getProperty(property) || "";
-  if (!expected) throw passwordError_(missingMessage);
-  var cache = CacheService.getScriptCache();
-  var failures = Number(cache.get(failKey) || 0);
-  if (failures >= PASSWORD_MAX_FAILURES) {
-    throw passwordError_("ใส่รหัสผิดหลายครั้งเกินไป กรุณารอ 15 นาที / Too many wrong attempts. Try again in 15 minutes.");
-  }
-  if (String(password == null ? "" : password) !== expected) {
-    cache.put(failKey, String(failures + 1), PASSWORD_LOCK_SECONDS);
-    Utilities.sleep(1000);
-    throw passwordError_("รหัสไม่ถูกต้อง / Incorrect password.");
-  }
+// Constant-time comparison of two digests (no early exit).
+function sameBytes_(a, b) {
+  var diff = a.length ^ b.length;
+  for (var i = 0; i < a.length && i < b.length; i++) diff |= (a[i] ^ b[i]);
+  return diff === 0;
+}
+
+function hex_(bytes) {
+  return bytes.map(function (b) { return ("0" + (b & 255).toString(16)).slice(-2); }).join("");
+}
+
+// Ties a session to the password it was opened with: a changed / removed
+// password ends the sessions of that level. Never the password itself.
+function fingerprint_(password) {
+  return hex_(digest_("balance-waste-session|" + password)).slice(0, 24);
 }
 
 function passwordError_(message) {
@@ -330,41 +348,121 @@ function passwordError_(message) {
   return error;
 }
 
-function cache_() {
-  return CacheService.getScriptCache();
+// Optional random id of the browser (sent by the page) for the per-client lockout.
+function clientId_(v) {
+  return typeof v === "string" && /^[0-9a-f]{16,64}$/.test(v) ? v : "";
 }
 
-/* ===================== treatment visibility token ===================== */
+var LOCKED_MESSAGE = "ใส่รหัสผิดหลายครั้งเกินไป กรุณารอ 15 นาที / Too many wrong attempts. Try again in 15 minutes.";
 
-// treat_unlock (password already checked, runs under the write lock so the
-// unlock is audited). The token is random (2 UUIDs); only its cache entry
-// (value: expiry ms) makes it valid.
-function actionTreatUnlock_() {
+function lockoutCheck_(client) {
+  var cache = cache_();
+  if (Number(cache.get(FAIL_GLOBAL_KEY) || 0) >= GLOBAL_MAX_FAILURES) throw passwordError_(LOCKED_MESSAGE);
+  if (client && Number(cache.get(FAIL_CLIENT_PREFIX + client) || 0) >= CLIENT_MAX_FAILURES) throw passwordError_(LOCKED_MESSAGE);
+}
+
+function recordFailure_(client) {
+  var cache = cache_();
+  cache.put(FAIL_GLOBAL_KEY, String(Number(cache.get(FAIL_GLOBAL_KEY) || 0) + 1), PASSWORD_LOCK_SECONDS);
+  if (client) {
+    var key = FAIL_CLIENT_PREFIX + client;
+    cache.put(key, String(Number(cache.get(key) || 0) + 1), PASSWORD_LOCK_SECONDS);
+  }
+  Utilities.sleep(1000);
+}
+
+function missingPasswordsMessage_() {
+  return "ยังไม่ได้ตั้งรหัสผ่านใน Script Properties (" + ROLE_ORDER.map(function (r) { return ROLE_PROPERTY[r]; }).join(", ") +
+    ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อน";
+}
+
+// Compares a typed password with one stored password (digests, constant time).
+function passwordMatches_(typed, expected) {
+  var ok = sameBytes_(digest_(typeof typed === "string" ? typed : ""), digest_(expected || ""));
+  return ok && typeof typed === "string" && Boolean(expected);
+}
+
+// login {password, client?} -> {token, role, role_name, expires_at, ttl}
+function actionLogin_(p) {
+  var client = clientId_(p.client);
+  var props = PropertiesService.getScriptProperties().getProperties() || {};
+  var configured = ROLE_ORDER.filter(function (r) { return Boolean(props[ROLE_PROPERTY[r]]); });
+  if (!configured.length) throw passwordError_(missingPasswordsMessage_());
+  lockoutCheck_(client);
+  var role = null;
+  ROLE_ORDER.forEach(function (r) { // every level is compared (no early exit)
+    var same = passwordMatches_(p.password, props[ROLE_PROPERTY[r]]);
+    if (same && !role) role = r;
+  });
+  if (!role) {
+    recordFailure_(client);
+    throw passwordError_("รหัสไม่ถูกต้อง / Incorrect password.");
+  }
+  if (client) {
+    try { cache_().remove(FAIL_CLIENT_PREFIX + client); } catch (ignored) {}
+  }
   var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "").toLowerCase();
-  var exp = Date.now() + TREAT_TOKEN_TTL * 1000;
-  cache_().put(TREAT_TOKEN_PREFIX + token, String(exp), TREAT_TOKEN_TTL);
-  audit_("setting", "treat_unlock", "ปลดล็อกการแสดงข้อมูลบำบัดเองภายใน (" + (TREAT_TOKEN_TTL / 3600) + " ชั่วโมง)", "");
-  return { token: token, expires_at: exp, ttl: TREAT_TOKEN_TTL, message: "แสดงข้อมูลบำบัดเองภายในแล้ว" };
-}
-
-function treatTokenOk_(token) {
-  if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) return false;
+  var now = Date.now();
+  var exp = now + SESSION_TTL * 1000;
   try {
-    var exp = Number(cache_().get(TREAT_TOKEN_PREFIX + token) || 0);
-    return exp > Date.now();
+    cache_().put(SESSION_PREFIX + token, JSON.stringify({ r: role, e: exp, p: now, f: fingerprint_(props[ROLE_PROPERTY[role]]) }), CACHE_MAX_TTL);
   } catch (error) {
-    return false;
+    fail_("ระบบเข้าสู่ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง");
   }
+  return { token: token, role: role, role_name: ROLE_NAME[role], expires_at: exp, ttl: SESSION_TTL };
 }
 
-function treatLock_(token) {
+function actionLogout_(token) {
   if (typeof token === "string" && /^[0-9a-f]{64}$/.test(token)) {
-    try { cache_().remove(TREAT_TOKEN_PREFIX + token); } catch (ignored) {}
+    try { cache_().remove(SESSION_PREFIX + token); } catch (ignored) {}
   }
-  return { locked: true };
+  return { loggedOut: true };
 }
 
-// True while the current request may see / write treatment data.
+// The session of a token, or null (unknown, expired, password changed, cache error).
+function session_(token) {
+  if (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)) return null;
+  var key = SESSION_PREFIX + token;
+  var rec;
+  try { rec = JSON.parse(cache_().get(key) || "null"); } catch (error) { return null; }
+  var now = Date.now();
+  if (!rec || typeof rec !== "object" || !Object.prototype.hasOwnProperty.call(ROLE_LEVEL, rec.r) || !(Number(rec.e) > now)) return null;
+  var pw = PropertiesService.getScriptProperties().getProperty(ROLE_PROPERTY[rec.r]) || "";
+  if (!pw || fingerprint_(pw) !== rec.f) return null;
+  if (!(now - Number(rec.p) < SESSION_RENEW_MS)) {
+    // CacheService keeps an entry <= 6 h: renew it while the 12 h session is in use.
+    rec.p = now;
+    var ttl = Math.max(1, Math.min(CACHE_MAX_TTL, Math.ceil((rec.e - now) / 1000)));
+    try { cache_().put(key, JSON.stringify(rec), ttl); } catch (ignored) {}
+  }
+  return { role: rec.r, expires_at: rec.e };
+}
+
+function requireRole_(token, need) {
+  var s = session_(token);
+  if (!s) fail_("กรุณาเข้าสู่ระบบ (ยังไม่ได้เข้าสู่ระบบ หรือเซสชันหมดอายุ)", "AUTH_REQUIRED");
+  if (ROLE_LEVEL[s.role] < ROLE_LEVEL[need]) {
+    fail_("สิทธิ์ “" + ROLE_NAME[s.role] + "” ทำรายการนี้ไม่ได้ (ต้องเป็น “" + ROLE_NAME[need] + "”)", "FORBIDDEN");
+  }
+  return s;
+}
+
+// reset_data: the admin password typed again (same lockout as login).
+function assertResetPassword_(password, client) {
+  var expected = PropertiesService.getScriptProperties().getProperty(RESET_PASSWORD_PROPERTY) || "";
+  if (!expected) {
+    throw passwordError_("ยังไม่ได้ตั้งรหัสผ่านผู้ดูแลใน Script Properties (" + RESET_PASSWORD_PROPERTY +
+      ") กรุณาให้ผู้ดูแลระบบตั้งค่าที่ Project Settings > Script properties ก่อน");
+  }
+  client = clientId_(client);
+  lockoutCheck_(client);
+  if (!passwordMatches_(password, expected)) {
+    recordFailure_(client);
+    throw passwordError_("รหัสไม่ถูกต้อง / Incorrect password.");
+  }
+}
+
+// True while the current request may see / write in-house (treat) data: admin only.
 function treatOn_() {
   return Boolean(REQ_ && REQ_.treat);
 }
@@ -394,7 +492,6 @@ function handleWrite_(action, input) {
     case "ship": return actionMove_("ship", input);
     case "opening": return actionMove_("opening", input);
     case "treat": return actionMove_("treat", input);
-    case "treat_unlock": return actionTreatUnlock_();
     case RESET_ACTION: return actionResetData_();
     case "movement_update": return actionMovementUpdate_(input);
     case "movement_delete": return actionMovementDelete_(input);
@@ -549,7 +646,7 @@ function validateLedger_(moves, verb, newMove) {
   var t = typeLabel_(p.move.type_id);
   var when = dtTh_(p.move.moved_at);
   var detail = p.what === "weight"
-    ? "น้ำหนักคงเหลือของ " + t + " ณ " + when + " มี " + fmtKg_(kgOf_(p.have)) + " กก. แต่ต้องนำออก " + fmtKg_(kgOf_(p.need)) + " กก."
+    ? "น้ำหนักคงเหลือของ " + t + " ณ " + when + " มี " + fmtT_(kgOf_(p.have)) + " ตัน แต่ต้องนำออก " + fmtT_(kgOf_(p.need)) + " ตัน"
     : "จำนวน" + (CONTAINERS[p.move.container] || p.move.container) + "ของ " + t + " ณ " + when + " มี " + p.have +
       " ภาชนะ แต่ต้องนำออก " + p.need + " ภาชนะ";
   if (newMove && p.move === newMove) fail_(verb + " — " + detail, "NEGATIVE_BALANCE");
@@ -576,6 +673,8 @@ function actionBootstrap_() {
     types: core.types,
     balance: core.balance,
     treat: treatOn_(),
+    role: (REQ_ && REQ_.role) || null,
+    role_name: REQ_ && REQ_.role ? ROLE_NAME[REQ_.role] : "",
     containers: CONTAINERS,
     company: COMPANY,
     limits: { quotaWarnPct: QUOTA_WARN_PCT, storageAlertDays: STORAGE_ALERT_DAYS },
@@ -588,7 +687,7 @@ function modeTag_() {
   return treatOn_() ? "t_" : "";
 }
 
-// Movements a request may see (treatment rows only with a treatment token).
+// Movements a request may see (in-house "treat" rows for admin only).
 function visibleMoves_() {
   var rows = table_("movements").rows;
   return treatOn_() ? rows : rows.filter(function (m) { return m.kind !== "treat"; });
@@ -706,7 +805,7 @@ function actionDashboard_() {
 
 // Audit rows about treatment (left out of counts in hidden mode).
 function treatLog_(l) {
-  return l.action === "treat" || l.action === "treat_unlock" || /^TR-/.test(String(l.ref || ""));
+  return l.action === "treat" || l.action === "treat_unlock" || /^TR-/.test(String(l.ref || "")); // treat_unlock: older rows
 }
 
 function queryHistory_(p) {
@@ -738,22 +837,22 @@ function queryHistory_(p) {
   });
 }
 
-// "รายการ" is the movement type column. With a treatment token the export also
-// has the treatment rows and a "วิธีบำบัด / ระบบ" column; a treatment row has
-// no receiver (treated inside the plant, not shipped).
+// "รายการ" is the movement type column; weights in tons. For admin the export
+// also has the in-house (treat) rows and a "ระบบ / วิธีการ" column; such a row
+// has no receiver (handled inside the plant, not shipped).
 function exportHistory_(items) {
   var showTreat = treatOn_();
   var head = ["เลขที่เอกสาร", "วันที่", "เวลา", "รายการ", "รหัสของเสีย", "ชื่อของเสีย", "รหัสการจัดการ",
-    "ผู้รับดำเนินการ", "น้ำหนัก (กก.)", "ภาชนะ", "จำนวนภาชนะ", "สถานที่จัดเก็บ", "เลขที่ใบกำกับการขนส่ง",
+    "ผู้รับดำเนินการ", "น้ำหนัก (ตัน)", "ภาชนะ", "จำนวนภาชนะ", "สถานที่จัดเก็บ", "เลขที่ใบกำกับการขนส่ง",
     "ทะเบียนรถ", "หมายเหตุ", "ผู้บันทึก"];
-  if (showTreat) head.push("วิธีบำบัด / ระบบ");
+  if (showTreat) head.push("ระบบ / วิธีการ");
   var lines = [csvLine_(head)];
   items.forEach(function (r) {
     var treat = r.kind === "treat";
     // Codes keep their leading zeros in Excel (="080409"; validated digits only).
     var line = [r.doc_no, r.moved_at.slice(0, 10), r.moved_at.slice(11, 16), KIND_NAME[r.kind] || r.kind,
-      excelText_(r.code), csvText_(r.type_name), excelText_(r.mgmt_code), treat ? "บำบัดเองภายในโรงงาน" : csvText_(r.receiver),
-      Number(r.weight_kg).toFixed(2), CONTAINERS[r.container] || r.container, r.containers, csvText_(r.location),
+      excelText_(r.code), csvText_(r.type_name), excelText_(r.mgmt_code), treat ? "ภายในโรงงาน" : csvText_(r.receiver),
+      tonsText_(r.weight_kg, false), CONTAINERS[r.container] || r.container, r.containers, csvText_(r.location),
       csvText_(r.manifest_no), csvText_(r.vehicle), csvText_(r.note), csvText_(r.actor)];
     if (showTreat) line.push(csvText_(r.method));
     lines.push(csvLine_(line));
@@ -796,9 +895,9 @@ function exportLogs_(items) {
 
 /* ===================== write actions ===================== */
 
-// store / ship / opening / treat. All take: type_id, weight_kg, container,
+// store / ship / opening / treat. All take: type_id, weight_t (tons), container,
 // containers, date, time, location, note; ship also manifest_no, vehicle;
-// treat also method (วิธีบำบัด / ระบบ). Ship and treat may use an inactive
+// treat also method (ระบบ / วิธีการ). Ship and treat may use an inactive
 // type (they only take out what is already in the plant).
 function actionMove_(kind, input) {
   var f = moveFields_(kind, input, null);
@@ -811,13 +910,13 @@ function actionMove_(kind, input) {
     moved_at: f.moved_at, created_at: nowParts_().datetime, actor: REQ_.actor, updated_at: null, updated_by: "",
     method: f.method
   });
-  var verb = kind === "ship" ? "ส่งกำจัดเกินยอดคงเหลือ" : kind === "treat" ? "บำบัดเกินยอดคงเหลือ" : "บันทึกไม่ได้";
+  var verb = kind === "ship" ? "ส่งกำจัดเกินยอดคงเหลือ" : kind === "treat" ? "ข้อมูลภายในเกินยอดคงเหลือ" : "บันทึกไม่ได้";
   validateLedger_(table_("movements").rows, verb, row);
   audit_("waste", kind, describeMove_(row), doc);
   var b = balances_()[f.type_id];
   return {
     id: row.id, doc_no: doc, kind: kind, balance_kg: b.balance_kg,
-    message: KIND_NAME[kind] + " " + t.name + " " + fmtKg_(f.weight_kg) + " กก. เรียบร้อย (" + doc + ")"
+    message: KIND_NAME[kind] + " " + t.name + " " + fmtT_(f.weight_kg) + " ตัน เรียบร้อย (" + doc + ")"
   };
 }
 
@@ -826,9 +925,10 @@ function moveFields_(kind, input, base) {
   var pick = function (k) { return base && input[k] === undefined ? base[k] : input[k]; };
   var typeId = phpInt_(pick("type_id"));
   if (!typeMap_()[typeId]) fail_("กรุณาเลือกประเภทของเสีย");
-  var weight = numIn_(pick("weight_kg"), "น้ำหนัก (กก.)", 2);
-  if (!(weight > 0)) fail_("น้ำหนักต้องมากกว่า 0 กก.");
-  if (weight > MAX_WEIGHT_KG) fail_("น้ำหนักต่อรายการต้องไม่เกิน " + fmtKg_(MAX_WEIGHT_KG) + " กก.");
+  // weight_t (tons) from the page; an edit without weight_t keeps the stored kg.
+  var weight = base && input.weight_t === undefined ? base.weight_kg : tonsToKg_(input.weight_t);
+  if (!(weight > 0)) fail_("น้ำหนักต้องมากกว่า 0 ตัน");
+  if (weight > MAX_WEIGHT_KG) fail_("น้ำหนักต่อรายการต้องไม่เกิน " + fmtT_(MAX_WEIGHT_KG) + " ตัน");
   var container = phpTrim_(safeStr_(pick("container")));
   if (CONTAINER_KEYS.indexOf(container) === -1) fail_("กรุณาเลือกภาชนะบรรจุ (ถัง 200 ลิตร / IBC / Bigbag)");
   var cRaw = phpTrim_(safeStr_(pick("containers")));
@@ -849,7 +949,7 @@ function moveFields_(kind, input, base) {
     location: text("location", 100, "สถานที่จัดเก็บ"),
     manifest_no: ship ? text("manifest_no", 60, "เลขที่ใบกำกับการขนส่ง") : "",
     vehicle: ship ? text("vehicle", 40, "ทะเบียนรถ") : "",
-    method: kind === "treat" ? text("method", 120, "วิธีบำบัด / ระบบ") : "",
+    method: kind === "treat" ? text("method", 120, "ระบบ / วิธีการ") : "",
     note: text("note", MAX_TEXT, "หมายเหตุ")
   };
 }
@@ -870,13 +970,13 @@ function numIn_(v, label, decimals) {
 
 function describeMove_(m) {
   var t = typeMap_()[m.type_id] || { code: "?", name: "?", receiver: "" };
-  return KIND_NAME[m.kind] + " " + t.code + " " + t.name + " น้ำหนัก " + fmtKg_(m.weight_kg) + " กก. · " +
+  return KIND_NAME[m.kind] + " " + t.code + " " + t.name + " น้ำหนัก " + fmtT_(m.weight_kg) + " ตัน · " +
     (CONTAINERS[m.container] || m.container) + " " + m.containers + " ภาชนะ · เวลา " + dtTh_(m.moved_at) +
     (m.kind === "ship" ? " · ผู้รับ: " + t.receiver : "") +
     (m.location ? " · ที่เก็บ: " + m.location : "") +
     (m.manifest_no ? " · ใบกำกับ: " + m.manifest_no : "") +
     (m.vehicle ? " · ทะเบียนรถ: " + m.vehicle : "") +
-    (m.method ? " · วิธีบำบัด: " + m.method : "") +
+    (m.method ? " · ระบบ / วิธีการ: " + m.method : "") +
     (m.note ? " · " + m.note : "");
 }
 
@@ -1059,12 +1159,32 @@ function textIn_(input, key, max, label) {
   return value;
 }
 
-function fmtKg_(n) {
-  var s = (Math.round(Number(n) * 100) / 100).toFixed(2);
-  var parts = s.split(".");
-  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  var dec = parts[1].replace(/0+$/, "");
-  return dec ? parts[0] + "." + dec : parts[0];
+/* Tons <-> kg. The sheet keeps kg with 0.01 kg precision, so a ton value has
+ * at most 5 decimals; the conversion works on whole hundredths of a kg. */
+
+// weight_t from the page ("0.125", "1,234.5", 2) -> kg (0.125 t -> 125 kg).
+function tonsToKg_(v) {
+  var t = numIn_(v, "น้ำหนัก (ตัน)", 5);
+  return Math.round(t * 100000) / 100;
+}
+
+// kg -> tons text: thousands separators, 3 decimals (more only when the kg
+// amount has a fraction, e.g. older rows: 1234.56 kg -> "1.23456").
+function tonsText_(kg, sep) {
+  var c = Math.round(Number(kg || 0) * 100);
+  var neg = c < 0;
+  c = Math.abs(c);
+  var whole = String(Math.floor(c / 100000));
+  var frac = String(c % 100000);
+  while (frac.length < 5) frac = "0" + frac;
+  frac = frac.replace(/0+$/, "");
+  while (frac.length < 3) frac += "0";
+  if (sep) whole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return (neg ? "-" : "") + whole + "." + frac;
+}
+
+function fmtT_(kg) {
+  return tonsText_(kg, true);
 }
 
 function dtTh_(s) {
@@ -1563,14 +1683,25 @@ function setupSystem() {
   flush_();
   REQ_ = null;
 
+  var passwords = {};
+  var missing = [];
+  ROLE_ORDER.forEach(function (r) {
+    passwords[ROLE_PROPERTY[r]] = Boolean(properties.getProperty(ROLE_PROPERTY[r]));
+    if (!passwords[ROLE_PROPERTY[r]]) missing.push(ROLE_PROPERTY[r] + " (" + ROLE_NAME[r] + ")");
+  });
   var result = {
     created: created,
     spreadsheetId: ss.getId(),
     spreadsheetUrl: ss.getUrl(),
     seededTypes: seeded,
-    resetPasswordConfigured: Boolean(properties.getProperty(RESET_PASSWORD_PROPERTY))
+    resetPasswordConfigured: passwords[RESET_PASSWORD_PROPERTY],
+    passwords: passwords,
+    passwordMessage: missing.length
+      ? "ยังไม่ได้ตั้ง Script Property: " + missing.join(", ") + " — ระดับนั้นจะเข้าสู่ระบบไม่ได้จนกว่าจะตั้งค่า (Project Settings > Script properties)"
+      : "ตั้งรหัสผ่านครบทั้ง 3 ระดับแล้ว"
   };
   console.log(JSON.stringify(result));
+  console.log(result.passwordMessage);
   return result;
 }
 

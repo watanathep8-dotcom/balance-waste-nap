@@ -14,7 +14,7 @@
   <link rel="preconnect" href="https://script.googleusercontent.com">
   <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700;800&family=Prompt:wght@300;400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
-  <link rel="stylesheet" href="assets/style.css?v=3">
+  <link rel="stylesheet" href="assets/style.css?v=4">
 </head>
 <body>
   <!-- พื้นหลังเคลื่อนไหว (transform / opacity เท่านั้น) -->
@@ -42,15 +42,15 @@
     </a>
     <nav class="nav">
       <a href="#dashboard" data-page="dashboard"><i class="fa-solid fa-gauge-high"></i><span>แดชบอร์ด</span></a>
-      <div class="nav-label">ทำรายการ</div>
-      <a href="#store" data-page="store"><i class="fa-solid fa-box-archive"></i><span>บันทึกจัดเก็บ</span></a>
-      <a href="#ship" data-page="ship"><i class="fa-solid fa-truck-arrow-right"></i><span>ส่งกำจัด / นำออก</span></a>
-      <a href="#treat" data-page="treat" class="treat-nav" id="treatNav"><i class="fa-solid fa-flask-vial"></i><span>บำบัดเองภายใน</span><b class="tn-lock" aria-hidden="true"><i class="fa-solid fa-lock"></i></b></a>
+      <div class="nav-label" data-role="staff">ทำรายการ</div>
+      <a href="#store" data-page="store" data-role="staff"><i class="fa-solid fa-box-archive"></i><span>บันทึกจัดเก็บ</span></a>
+      <a href="#ship" data-page="ship" data-role="staff"><i class="fa-solid fa-truck-arrow-right"></i><span>ส่งกำจัด / นำออก</span></a>
+      <a href="#treat" data-page="treat" class="treat-nav" id="treatNav" hidden><i class="fa-solid fa-flask-vial"></i><span>ข้อมูลภายใน</span></a>
       <div class="nav-label">รายงาน</div>
       <a href="#balance" data-page="balance"><i class="fa-solid fa-scale-balanced"></i><span>คงเหลือ &amp; โควตา</span><b class="badge" id="alertBadge"></b></a>
       <a href="#history" data-page="history"><i class="fa-solid fa-clock-rotate-left"></i><span>ประวัติรายการ</span></a>
-      <a href="#logs" data-page="logs"><i class="fa-solid fa-clipboard-list"></i><span>บันทึกประวัติ (Log)</span></a>
-      <a href="#settings" data-page="settings"><i class="fa-solid fa-gear"></i><span>ตั้งค่าประเภทของเสีย</span></a>
+      <a href="#logs" data-page="logs" data-role="admin"><i class="fa-solid fa-clipboard-list"></i><span>บันทึกประวัติ (Log)</span></a>
+      <a href="#settings" data-page="settings" data-role="admin"><i class="fa-solid fa-gear"></i><span>ตั้งค่าประเภทของเสีย</span></a>
     </nav>
     <div class="side-foot">
       <b>บริษัท แน็ป นิวตริซายส์ (ประเทศไทย) จำกัด</b>
@@ -69,17 +69,22 @@
       </div>
       <div class="top-actions">
         <div class="clock hide-sm"><i class="fa-regular fa-clock"></i><span id="clock">--:--:--</span><small id="clockDate"></small></div>
-        <button class="user-chip" id="userChip" title="ตั้งชื่อผู้ใช้งาน"><span class="av" id="userAv"><i class="fa-solid fa-user"></i></span><span class="un" id="userName">ระบุชื่อผู้ใช้</span></button>
+        <div class="user-box" id="userBox" hidden>
+          <button class="user-chip" id="userChip" title="ตั้งชื่อผู้ใช้งาน (ผู้บันทึก)"><span class="av" id="userAv"><i class="fa-solid fa-user"></i></span><span class="ut"><span class="un" id="userName">ระบุชื่อผู้ใช้</span><span class="role-tag" id="roleTag"></span></span></button>
+          <button class="logout-btn" id="logoutBtn" type="button" title="ออกจากระบบ" aria-label="ออกจากระบบ"><i class="fa-solid fa-right-from-bracket"></i></button>
+        </div>
       </div>
     </header>
     <div class="cfg-banner" id="cfgBanner" hidden><i class="fa-solid fa-plug-circle-exclamation"></i><div><b>ยังไม่ได้ตั้งค่า apiUrl</b><br><small>ใส่ URL ของ Google Apps Script Web App (ลงท้ายด้วย <code>/exec</code>) ในไฟล์ <code>docs/config.js</code> แล้วโหลดหน้านี้ใหม่</small></div></div>
     <section id="view" class="view"></section>
     <footer class="foot">
       <span><i class="fa-solid fa-recycle"></i> Balance Waste · บริษัท แน็ป นิวตริซายส์ (ประเทศไทย) จำกัด</span>
-      <span class="foot-r"><span class="programming-credit">Programming by Duongruthai_Milk</span><button class="treat-lock" id="treatLock" type="button" aria-label="แสดง / ซ่อนข้อมูลบำบัดเองภายใน"><i class="fa-solid fa-lock"></i></button></span>
+      <span class="foot-r"><span class="programming-credit">Programming by Duongruthai_Milk</span><button class="treat-lock" id="treatLock" type="button" hidden aria-label="แสดง / ซ่อนข้อมูลภายใน"><i class="fa-solid fa-lock"></i></button></span>
     </footer>
   </main>
 
+  <!-- หน้าเข้าสู่ระบบ: คลุมทั้งหน้าจนกว่าจะมีเซสชัน (เซิร์ฟเวอร์ตรวจสิทธิ์ทุกคำสั่ง) -->
+  <div id="login" class="login"><div class="login-card"><div class="eco-logo login-logo" aria-hidden="true"><span class="ring"></span><span class="core"><i class="fa-solid fa-recycle"></i></span></div></div></div>
   <div id="toasts" class="toasts"></div>
   <div id="modal" class="modal" hidden><div class="modal-card" id="modalCard"></div></div>
   <div id="pwModal" class="modal" hidden style="z-index:95"><div class="modal-card" id="pwCard"></div></div>
@@ -88,6 +93,6 @@
   <!-- defer: same order (Chart.js -> config -> app), run once the page is parsed -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" defer></script>
   <script src="config.js?v=2" defer></script>
-  <script src="assets/app.js?v=5" defer></script>
+  <script src="assets/app.js?v=6" defer></script>
 </body>
 </html>

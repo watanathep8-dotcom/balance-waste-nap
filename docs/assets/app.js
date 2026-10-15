@@ -11,9 +11,9 @@ const KIND = {
   store:   { name: 'บันทึกจัดเก็บ', short: 'จัดเก็บ', icon: 'fa-box-archive', c: '#10B981', cls: 'in', sign: '+' },
   ship:    { name: 'ส่งกำจัด / นำออก', short: 'ส่งกำจัด', icon: 'fa-truck-arrow-right', c: '#F97316', cls: 'out', sign: '−' },
   opening: { name: 'ยอดยกมา', short: 'ยอดยกมา', icon: 'fa-flag-checkered', c: '#6366F1', cls: 'open', sign: '+' },
-  treat:   { name: 'บำบัดเองภายใน', short: 'บำบัดเอง', icon: 'fa-flask-vial', c: '#7C3AED', cls: 'treat', sign: '−' },
+  treat:   { name: 'ข้อมูลภายใน', short: 'ข้อมูลภายใน', icon: 'fa-flask-vial', c: '#7C3AED', cls: 'treat', sign: '−' },
 };
-// Movement kinds the current view may show (treatment only while unlocked).
+// Movement kinds the current view may show (in-house data: admin, not hidden).
 const kinds = () => Object.entries(KIND).filter(([k]) => k !== 'treat' || treatOn());
 const CONT = {
   drum200: { name: 'ถัง 200 ลิตร', sub: 'Drum 200 L' },
@@ -25,7 +25,7 @@ const PAGES = {
   dashboard: ['แดชบอร์ด', 'ภาพรวมของเสียในโรงงาน · โควตาตามหนังสืออนุญาต สก.2'],
   store: ['บันทึกจัดเก็บ', 'ลงข้อมูลของเสียที่จัดเก็บในโรงงาน — เลือกประเภท กรอกน้ำหนัก เลือกภาชนะ'],
   ship: ['ส่งกำจัด / นำออก', 'ส่งของเสียให้ผู้รับดำเนินการ — ไม่เกินยอดคงเหลือ'],
-  treat: ['บำบัดเองภายใน', 'บำบัดของเสียด้วยระบบของโรงงานเอง — ตัดยอดคงเหลือ ไม่นับโควตา สก.2'],
+  treat: ['ข้อมูลภายใน', 'รายการภายในโรงงาน — ตัดยอดคงเหลือ ไม่นับโควตา สก.2 · เฉพาะผู้ดูแลระบบ'],
   balance: ['คงเหลือ & โควตา', 'ยอดคงเหลือในโรงงาน ภาชนะ และการใช้โควตาปีนี้'],
   history: ['ประวัติรายการ', 'ทุกรายการจัดเก็บ / ส่งกำจัด · ค้นหา · ส่งออก Excel'],
   logs: ['บันทึกประวัติ (Log)', 'ทุกการกระทำในระบบ — ใคร ทำอะไร เมื่อไร'],
@@ -33,7 +33,7 @@ const PAGES = {
 };
 
 /* ---------- API (Google Apps Script web app) ---------- */
-// อ่านข้อมูล = GET ?action=...&_=ts  /  บันทึก = POST text/plain (JSON) — ไม่เกิด CORS preflight
+// ทุกคำสั่ง = POST text/plain (JSON) พร้อม token ของเซสชันใน body — ไม่เกิด CORS preflight และ token ไม่อยู่ใน URL
 const API_URL = String((window.WASTE_CONFIG || {}).apiUrl || '').trim();
 const NO_API_MSG = 'ยังไม่ได้ตั้งค่า apiUrl — ใส่ URL ของ Google Apps Script (/exec) ในไฟล์ docs/config.js';
 async function gasFetch(url, opt) {
@@ -50,14 +50,41 @@ async function gasFetch(url, opt) {
   }
   return { ok: true, ...(j.data || {}) };
 }
-function gasGet(action, params = '') {
-  if (!API_URL) return Promise.reject(new Error(NO_API_MSG));
-  const u = new URL(API_URL, location.href);
-  new URLSearchParams(params.replace(/^&/, '')).forEach((v, k) => u.searchParams.set(k, v));
-  u.searchParams.set('action', action);
-  u.searchParams.set('_', Date.now());
-  return gasFetch(u.toString(), { method: 'GET' });
+const postJson = body => gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify(body) });
+
+/* ---------- เข้าสู่ระบบ: 3 ระดับสิทธิ์ (เซิร์ฟเวอร์ตรวจสิทธิ์ทุกคำสั่ง — หน้าเว็บแค่ซ่อนปุ่มที่ใช้ไม่ได้) ----------
+   viewer = เข้าดูได้อย่างเดียว · staff = พนักงานกรอกข้อมูล (+ บันทึกจัดเก็บ / ยอดยกมา / ส่งกำจัด)
+   admin = ผู้ดูแลระบบ (ทุกอย่าง: แก้ไข / ลบ, ตั้งค่า, Log, รีเซ็ต, ข้อมูลภายใน)
+   token เก็บใน sessionStorage ของแท็บนี้เท่านั้น (ปิดแท็บ = ออกจากระบบ) · รหัสผ่านไม่ถูกเก็บที่ใดเลย */
+const ROLE_LV = { viewer: 1, staff: 2, admin: 3 };
+const ROLE_TH = { viewer: 'เข้าดูได้อย่างเดียว', staff: 'พนักงานกรอกข้อมูล', admin: 'ผู้ดูแลระบบ' };
+const ROLE_IC = { viewer: 'fa-eye', staff: 'fa-user-pen', admin: 'fa-user-shield' };
+const SESS_KEY = 'wasteSess';
+const ss = (fn, k, v) => { try { return fn === 'get' ? sessionStorage.getItem(k) : fn === 'del' ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch { return null; } };
+function sessLoad() {
+  try {
+    const v = JSON.parse(ss('get', SESS_KEY) || 'null');
+    if (v && /^[0-9a-f]{64}$/.test(v.t) && ROLE_LV[v.role] && v.exp > Date.now()) return v;
+  } catch {}
+  ss('del', SESS_KEY);
+  return null;
 }
+S.sess = sessLoad();
+const can = role => !!S.sess && ROLE_LV[S.sess.role] >= ROLE_LV[role];
+// random id of this browser: only for the per-browser lockout of wrong passwords
+const CLIENT_ID = (() => {
+  let id = store('get', 'wasteClient') || '';
+  if (!/^[0-9a-f]{32}$/.test(id)) {
+    try { id = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''); } catch { id = ''; }
+    if (id) store('set', 'wasteClient', id);
+  }
+  return id;
+})();
+/* ข้อมูลภายใน (kind treat): เซิร์ฟเวอร์ส่งให้เฉพาะ token ผู้ดูแลระบบ · ผู้ดูแลกดไอคอนกุญแจท้ายหน้าเพื่อซ่อนบนหน้าจอได้ */
+const HT_KEY = 'wasteHideTT';
+S.hideT = ss('get', HT_KEY) === '1';
+const treatOn = () => can('admin') && !S.hideT;
+
 // Actions that change data: the user's name (top-right) must be set first.
 const NAME_REQUIRED = ['store', 'ship', 'opening', 'treat', 'movement_update', 'movement_delete', 'type_save', 'reset_data'];
 async function gasPost(payload) {
@@ -67,164 +94,97 @@ async function gasPost(payload) {
     if (!S.user) throw new Error('กรุณาระบุชื่อผู้ใช้งาน (มุมขวาบน) ก่อนบันทึก');
   }
   const body = { actor: S.user || '', ...payload };
-  if (S.tt) body.treatToken = S.tt; // in the POST body only, never in a URL
+  if (S.sess) body.token = S.sess.t; // in the POST body only, never in a URL
+  if (can('admin') && !treatOn()) body.hideTreat = true;
   try {
-    return await gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify(body) });
+    return await postJson(body);
   } catch (e) {
-    if (e.code === 'TREAT_LOCKED') dropTreat();
+    if (e.code === 'AUTH_REQUIRED') sessionEnded('เซสชันหมดอายุหรือถูกยกเลิก — กรุณาเข้าสู่ระบบใหม่');
     throw e;
   }
 }
-// Reads: GET normally; POST while the treatment view is unlocked (token in the body).
+// Reads: POST with the session token (params in the body).
+const qsObj = params => Object.fromEntries(new URLSearchParams(String(params || '').replace(/^&/, '')));
 function readApi(action, params = '') {
-  if (!S.tt) return gasGet(action, params);
-  return gasPost({ ...Object.fromEntries(new URLSearchParams(params.replace(/^&/, ''))), action });
+  return gasPost({ ...qsObj(params), action });
 }
 async function api(action, body, params = '') {
   if (!body) return readApi(action, params);
   return gasPost({ ...body, action });
 }
 
-/* ---------- บำบัดเองภายใน: ซ่อนไว้โดยค่าเริ่มต้น ----------
-   ปลดล็อกด้วยรหัสผ่านผู้ดูแล → เซิร์ฟเวอร์ออก token ชั่วคราว (เก็บใน sessionStorage ของแท็บนี้เท่านั้น)
-   ระหว่างปลดล็อก การอ่านจะส่งแบบ POST พร้อม token และไม่เก็บแคชใน localStorage · ล็อกเมื่อไร token ถูกลบทันที */
-const TT_KEY = 'wasteTT';
-function ttLoad() {
-  try {
-    const v = JSON.parse(sessionStorage.getItem(TT_KEY) || 'null');
-    if (v && /^[0-9a-f]{64}$/.test(v.t) && v.exp > Date.now()) return v.t;
-    sessionStorage.removeItem(TT_KEY);
-  } catch {}
-  return '';
+/* ---------- หน้าเข้าสู่ระบบ ---------- */
+function showLogin(msg = '') {
+  const box = $('#login');
+  box.innerHTML = `<div class="login-card" role="dialog" aria-modal="true" aria-labelledby="lgTitle">
+      ${ecoLogo('login-logo')}
+      <h1 id="lgTitle">Balance<span>Waste</span></h1>
+      <p class="lg-sub">ระบบบริหารจัดการของเสีย</p>
+      <p class="lg-co">บริษัท แน็ป นิวตริซายส์ (ประเทศไทย) จำกัด</p>
+      <form id="lgForm" autocomplete="off">
+        <div class="field"><label for="lgPw">รหัสผ่าน</label>
+          <div class="lg-pw"><i class="fa-solid fa-key"></i><input type="password" id="lgPw" autocomplete="current-password" placeholder="ใส่รหัสผ่านเพื่อเข้าใช้งาน"><button type="button" id="lgEye" aria-label="แสดงรหัสผ่าน"><i class="fa-regular fa-eye"></i></button></div></div>
+        <div class="lg-err" id="lgErr" role="alert">${esc(msg)}</div>
+        <button class="btn btn-primary btn-lg" id="lgGo" type="submit"><i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ</button>
+      </form>
+      <div class="lg-roles">
+        <span><i class="fa-solid ${ROLE_IC.viewer}"></i>${ROLE_TH.viewer}</span>
+        <span><i class="fa-solid ${ROLE_IC.staff}"></i>${ROLE_TH.staff}</span>
+        <span><i class="fa-solid ${ROLE_IC.admin}"></i>${ROLE_TH.admin}</span>
+      </div>
+      <p class="lg-hint">สิทธิ์การใช้งานขึ้นกับรหัสผ่านที่ได้รับจากผู้ดูแลระบบ · ออกจากระบบอัตโนมัติเมื่อปิดแท็บ หรือครบ 12 ชั่วโมง</p>
+    </div>`;
+  box.hidden = false;
+  document.body.classList.add('locked');
+  const inp = $('#lgPw', box), go = $('#lgGo', box), errEl = $('#lgErr', box);
+  if (!API_URL) errEl.textContent = NO_API_MSG;
+  $('#lgEye', box).onclick = () => { inp.type = inp.type === 'password' ? 'text' : 'password'; inp.focus(); };
+  $('#lgForm', box).onsubmit = async e => {
+    e.preventDefault();
+    if (go.disabled) return; // Enter again while checking: one request (each wrong one counts toward the lockout)
+    const pw = inp.value;
+    if (!pw) { errEl.textContent = 'กรุณาใส่รหัสผ่าน'; inp.focus(); return; }
+    if (!API_URL) { errEl.textContent = NO_API_MSG; return; }
+    go.disabled = true; go.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังตรวจสอบ...'; errEl.textContent = '';
+    try {
+      const r = await postJson({ action: 'login', password: pw, client: CLIENT_ID });
+      inp.value = '';
+      S.sess = { t: r.token, role: r.role, exp: r.expires_at };
+      ss('set', SESS_KEY, JSON.stringify(S.sess));
+      rcClear();
+      box.hidden = true; box.innerHTML = '';
+      document.body.classList.remove('locked');
+      paintRole();
+      toast(`เข้าสู่ระบบแล้ว — สิทธิ์: ${ROLE_TH[r.role]}`, 'info');
+      route();
+    } catch (err) {
+      errEl.textContent = err.message; inp.value = ''; inp.focus();
+      go.disabled = false; go.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i>เข้าสู่ระบบ';
+    }
+  };
+  setTimeout(() => inp.focus(), 50);
 }
-S.tt = ttLoad();
-const treatOn = () => !!S.tt;
-function paintTreat() {
-  const on = treatOn();
-  // the menu is always there; while locked it carries a lock badge and asks for the admin password on click
-  $('#treatNav').classList.toggle('locked', !on);
-  $('#treatNav').title = on ? '' : 'ต้องใส่รหัสผ่านผู้ดูแลเพื่อเปิด';
-  const b = $('#treatLock');
-  b.classList.toggle('on', on);
-  b.innerHTML = `<i class="fa-solid ${on ? 'fa-lock-open' : 'fa-lock'}"></i>`;
-  b.title = on ? 'กำลังแสดงข้อมูลบำบัดเองภายใน — คลิกเพื่อซ่อน (ล็อก)' : 'แสดงข้อมูลบำบัดเองภายใน (ต้องใช้รหัสผ่านผู้ดูแล)';
-  document.body.classList.toggle('treat-on', on);
-}
-// Token gone (locked here, expired or refused by the server): back to the hidden view.
-function dropTreat(msg) {
-  if (!S.tt) return;
-  S.tt = '';
-  try { sessionStorage.removeItem(TT_KEY); } catch {}
+// Session gone (logged out, expired, password changed): back to the login screen.
+function sessionEnded(msg) {
+  const had = !!S.sess;
+  S.sess = null;
+  ss('del', SESS_KEY);
   rcClear();
-  paintTreat();
-  if (msg) toast(msg, 'info');
+  closeModal();
+  $('#pwModal').hidden = true;
+  killCharts(); view.onclick = null; view.innerHTML = '';
+  paintRole();
+  if (had || $('#login').hidden) showLogin(msg);
 }
-function unlockTreat() {
-  if (S.tt) return Promise.resolve(true);
-  return new Promise(resolve => {
-    const box = $('#pwModal'), card = $('#pwCard');
-    card.innerHTML = `<div class="treat-ic sm" aria-hidden="true"><span class="tr"></span><span class="tc"><i class="fa-solid fa-flask-vial"></i></span></div>
-      <h3 style="justify-content:center">แสดงข้อมูลบำบัดเองภายใน</h3>
-      <p class="hint" style="text-align:center">เมนูบำบัดเอง ยอดบำบัด และรายการบำบัดในประวัติ จะแสดงเฉพาะแท็บนี้หลังใส่รหัสผ่านผู้ดูแล (สูงสุด 6 ชั่วโมง หรือจนกว่าจะกดล็อก / ปิดแท็บ)</p>
-      <div class="field mt"><label>รหัสผ่านผู้ดูแล</label><input type="password" id="ttInput" autocomplete="off"></div>
-      <div id="ttErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
-      <div class="modal-acts"><button class="btn btn-ghost" id="ttCancel">ยกเลิก</button><button class="btn btn-treat" id="ttOk"><i class="fa-solid fa-lock-open"></i>ปลดล็อก</button></div>`;
-    box.hidden = false;
-    const inp = $('#ttInput', card), ok = $('#ttOk', card), err = $('#ttErr', card);
-    const done = v => { box.hidden = true; box.onclick = null; card.innerHTML = ''; resolve(v); };
-    const submit = async () => {
-      if (ok.disabled) return; // Enter again while checking: one request (each wrong one counts toward the lockout)
-      const pw = inp.value;
-      if (!pw) { err.textContent = 'กรุณาใส่รหัสผ่าน'; inp.focus(); return; }
-      ok.disabled = true; ok.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังตรวจสอบ...'; err.textContent = '';
-      try {
-        const r = await gasPost({ action: 'treat_unlock', resetPassword: pw });
-        S.tt = r.token;
-        try { sessionStorage.setItem(TT_KEY, JSON.stringify({ t: r.token, exp: r.expires_at })); } catch {}
-        rcClear(); paintTreat(); done(true);
-        toast('แสดงข้อมูลบำบัดเองภายในแล้ว (แท็บนี้)', 'info');
-      } catch (e) {
-        err.textContent = e.message; inp.value = ''; inp.focus();
-        ok.disabled = false; ok.innerHTML = '<i class="fa-solid fa-lock-open"></i>ปลดล็อก';
-      }
-    };
-    ok.onclick = submit;
-    $('#ttCancel', card).onclick = () => done(false);
-    box.onclick = e => { if (e.target === box) done(false); };
-    inp.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') submit(); if (e.key === 'Escape') done(false); };
-    inp.focus();
-  });
-}
-async function lockTreat() {
-  const tok = S.tt;
-  dropTreat('ซ่อนข้อมูลบำบัดเองภายในแล้ว');
-  if (tok) gasFetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: JSON.stringify({ action: 'treat_lock', treatToken: tok }) }).catch(() => {});
-  if (currentPage() === 'treat') location.hash = 'dashboard'; else route();
-}
-/* แก้ไข / ลบรายการ, Log, ตั้งค่าประเภท: ใช้รหัสผ่านผู้ดูแล (WASTE_RESET_PASSWORD)
-   เก็บในหน่วยความจำเท่านั้นหลังตรวจผ่าน (หายเมื่อรีเฟรช/ปิดหน้า) และล้างทิ้งเมื่อเซิร์ฟเวอร์แจ้งรหัสผิด/ถูกล็อก */
-let recordPassword = '';
-async function recordApi(action, body, reads = routeReads()) {
-  const pw = await askPassword();
-  try {
-    const r = await gasPost({ ...body, ...readsField(reads), action, resetPassword: pw });
-    afterWrite(r, reads);
-    return r;
-  } catch (e) {
-    if (e.passwordError) recordPassword = '';
-    throw e;
-  }
-}
-/* ถามรหัสครั้งเดียวต่อการเปิดหน้า แล้วตรวจกับเซิร์ฟเวอร์ (verifyResetPassword) */
-function askPassword() {
-  if (recordPassword) return Promise.resolve(recordPassword);
-  if (S.pwPending) return S.pwPending;
-  S.pwPending = new Promise((resolve, reject) => {
-    const box = $('#pwModal'), card = $('#pwCard');
-    card.innerHTML = `<h3><i class="fa-solid fa-user-shield" style="color:var(--brand)"></i> รหัสผ่านผู้ดูแล</h3>
-      <p class="hint">การแก้ไข / ลบรายการ การดูบันทึกประวัติ (Log) การตั้งค่าประเภทของเสีย และการรีเซ็ตข้อมูล ต้องใช้รหัสผ่าน (ตั้งโดยผู้ดูแลระบบ · ถามครั้งเดียวต่อการเปิดหน้านี้)</p>
-      <div class="field mt"><label>รหัสผ่านผู้ดูแล</label><input type="password" id="pwInput" autocomplete="off"></div>
-      <div id="pwErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
-      <div class="modal-acts"><button class="btn btn-ghost" id="pwCancel">ยกเลิก</button><button class="btn btn-primary" id="pwOk"><i class="fa-solid fa-unlock"></i>ยืนยัน</button></div>`;
-    box.hidden = false;
-    const inp = $('#pwInput', card), ok = $('#pwOk', card), err = $('#pwErr', card);
-    const done = () => { box.hidden = true; box.onclick = null; card.innerHTML = ''; };
-    const cancel = () => { done(); reject(new Error('ยกเลิก — ต้องใส่รหัสผ่านผู้ดูแลก่อน')); };
-    const submit = async () => {
-      if (ok.disabled) return; // Enter again while checking: one request (each wrong one counts toward the lockout)
-      const pw = inp.value;
-      if (!pw) { err.textContent = 'กรุณาใส่รหัสผ่าน'; inp.focus(); return; }
-      ok.disabled = true; ok.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังตรวจสอบ...'; err.textContent = '';
-      try {
-        await gasPost({ action: 'verifyResetPassword', resetPassword: pw });
-        recordPassword = pw; done(); resolve(pw);
-      } catch (e) {
-        err.textContent = e.message; inp.value = ''; inp.focus();
-        ok.disabled = false; ok.innerHTML = '<i class="fa-solid fa-unlock"></i>ยืนยัน';
-      }
-    };
-    ok.onclick = submit;
-    $('#pwCancel', card).onclick = cancel;
-    box.onclick = e => { if (e.target === box) cancel(); };
-    inp.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') submit(); if (e.key === 'Escape') cancel(); };
-    inp.focus();
-  }).finally(() => { S.pwPending = null; });
-  return S.pwPending;
-}
-/* บันทึกประวัติ (Log): ส่งแบบ POST พร้อมรหัส — รหัสไม่อยู่ใน URL */
-async function logsApi(action, params) {
-  const pw = await askPassword();
-  try {
-    return await gasPost({ ...Object.fromEntries(new URLSearchParams(params.replace(/^&/, ''))), action, resetPassword: pw });
-  } catch (e) {
-    if (e.passwordError) recordPassword = '';
-    throw e;
-  }
+function logout() {
+  const tok = S.sess && S.sess.t;
+  sessionEnded('ออกจากระบบแล้ว');
+  if (tok) postJson({ action: 'logout', token: tok }).catch(() => {});
 }
 /* ส่งออก Excel (CSV, UTF-8 BOM ให้ Excel ภาษาไทยอ่านถูก) */
 async function downloadCsv(action, params) {
   try {
-    const r = action === 'logs_export' ? await logsApi(action, params) : await readApi(action, params);
+    const r = await readApi(action, params);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob(['\uFEFF' + r.csv], { type: 'text/csv;charset=utf-8' }));
     a.download = r.filename;
@@ -235,34 +195,38 @@ async function downloadCsv(action, params) {
 if (!API_URL) $('#cfgBanner').hidden = false;
 function applyBoot(j) {
   Object.assign(S, { types: j.types, balance: j.balance, containers: j.containers || {}, company: j.company || {}, limits: j.limits || {}, now: j.now });
-  if (S.tt && !j.treat) dropTreat('หมดเวลาแสดงข้อมูลบำบัดเองภายใน — ซ่อนแล้ว (ปลดล็อกใหม่ได้ที่ไอคอนกุญแจด้านล่าง)');
+  // the server is the authority on the role of this session
+  if (S.sess && j.role && j.role !== S.sess.role && ROLE_LV[j.role]) {
+    S.sess.role = j.role; ss('set', SESS_KEY, JSON.stringify(S.sess)); paintRole();
+  }
 }
 
 /* ---------- อ่านหลายรายการในคำขอเดียว (batch) ---------- */
-const readsSpec = reads => reads.map(([a, p = '']) => ({ action: a, ...Object.fromEntries(new URLSearchParams(p.replace(/^&/, ''))) }));
+const readsSpec = reads => reads.map(([a, p = '']) => ({ action: a, ...qsObj(p) }));
 const readsField = reads => reads.length ? { reads: readsSpec(reads) } : {};
 async function readMany(reads) {
-  const r = S.tt ? await gasPost({ action: 'batch', reads: readsSpec(reads) })
-    : await gasGet('batch', '&reads=' + encodeURIComponent(JSON.stringify(readsSpec(reads))));
+  const r = await gasPost({ action: 'batch', reads: readsSpec(reads) });
   return r.results.map(d => ({ ok: true, ...d }));
 }
 
-/* ---------- แคชผลการอ่านล่าสุดในเบราว์เซอร์ (แสดงทันที แล้วโหลดใหม่เบื้องหลัง) ----------
-   ใช้เพื่อแสดงผลเท่านั้น — การบันทึกตรวจยอดที่เซิร์ฟเวอร์เสมอ · Log ไม่เก็บ · ล้างทั้งหมดหลังบันทึกทุกครั้ง
-   ระหว่างแสดงข้อมูลบำบัดเอง (S.tt) ไม่อ่าน/เขียนแคชนี้เลย */
+/* ---------- แคชผลการอ่านล่าสุดของแท็บนี้ (แสดงทันที แล้วโหลดใหม่เบื้องหลัง) ----------
+   sessionStorage เท่านั้น (หายเมื่อปิดแท็บ) · ใช้เพื่อแสดงผลเท่านั้น — การบันทึกตรวจยอดที่เซิร์ฟเวอร์เสมอ
+   Log ไม่เก็บ · ล้างทั้งหมดหลังบันทึก / เข้า-ออกจากระบบ · ระหว่างแสดงข้อมูลภายในไม่อ่าน/เขียนแคชนี้เลย */
 const RC_PREFIX = 'wasteRC:';
 const RC_FRESH_MS = 5000;
 const rcKey = ([a, p = '']) => RC_PREFIX + a + p;
 function rcGet(r) {
-  if (S.tt) return null;
-  try { const v = JSON.parse(localStorage.getItem(rcKey(r)) || 'null'); return v && v.d ? v : null; } catch { return null; }
+  if (treatOn() || !S.sess) return null;
+  try { const v = JSON.parse(sessionStorage.getItem(rcKey(r)) || 'null'); return v && v.d ? v : null; } catch { return null; }
 }
 function rcPut(r, d) {
-  if (!d || S.tt) return;
-  try { const s = JSON.stringify({ t: Date.now(), d }); if (s.length < 500000) localStorage.setItem(rcKey(r), s); } catch {}
+  if (!d || treatOn() || !S.sess) return;
+  try { const s = JSON.stringify({ t: Date.now(), d }); if (s.length < 500000) sessionStorage.setItem(rcKey(r), s); } catch {}
 }
 function rcClear() {
-  try { Object.keys(localStorage).filter(k => k.startsWith(RC_PREFIX)).forEach(k => localStorage.removeItem(k)); } catch {}
+  for (const st of [sessionStorage, localStorage]) { // localStorage: caches of the previous version
+    try { Object.keys(st).filter(k => k.startsWith(RC_PREFIX)).forEach(k => st.removeItem(k)); } catch {}
+  }
 }
 function afterWrite(r, reads) {
   rcClear();
@@ -276,8 +240,18 @@ async function writeApi(action, body, reads = routeReads()) {
 
 /* ---------- helpers ---------- */
 const fmt = (n, d = 0) => Number(n || 0).toLocaleString('th-TH', { maximumFractionDigits: d });
-const fmtKg = n => fmt(n, 2);
-const fmtT = kg => fmt(Number(kg || 0) / 1000, Math.abs(kg) < 10000 ? 3 : 2);
+const fmtFix = (n, d = 0) => Number(n || 0).toLocaleString('th-TH', { minimumFractionDigits: d, maximumFractionDigits: d });
+/* หน่วยแสดงผล = ตัน (ชีตเก็บเป็น กก.) — ทศนิยม 3 ตำแหน่ง (= 1 กก.) และมากกว่านั้นเฉพาะยอดที่มีเศษ กก. (ข้อมูลเดิม) */
+const fmtT = kg => (Number(kg || 0) / 1000).toLocaleString('th-TH', { minimumFractionDigits: 3, maximumFractionDigits: 5 });
+const fmtKgHint = kg => Number(kg || 0).toLocaleString('th-TH', { maximumFractionDigits: 2 });
+// kg -> exact ton text for an input (no separators), e.g. 1234.56 -> "1.23456", 125 -> "0.125"
+const tonsStr = kg => {
+  const c = Math.round(Math.abs(Number(kg || 0)) * 100);
+  const f = String(c % 100000).padStart(5, '0').replace(/0+$/, '');
+  return Math.floor(c / 100000) + (f ? '.' + f.padEnd(3, '0') : '');
+};
+// Weight typed in tons: up to 5 decimals (0.01 kg; normally 3 = 1 kg), returns kg or NaN.
+const parseT = v => { const s = String(v ?? '').replace(/,/g, '').trim(); return /^\d+(\.\d{1,5})?$/.test(s) ? Math.round(Number(s) * 100000) / 100 : NaN; };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const typeById = id => S.types.find(t => +t.id === +id);
 const balOf = id => S.balance[id] || { balance_kg: 0, containers: { drum200: 0, ibc: 0, bigbag: 0 }, shipped_year_kg: 0, permit_kg: 0, quota_pct: null, quota_level: 'ok' };
@@ -288,8 +262,6 @@ const receivers = () => [...new Set(S.types.map(t => t.receiver))];
 const shortRecv = r => String(r || '').replace(/^(บจก\.|บมจ\.|บริษัท)\s*/, '').replace('บริหารและพัฒนาเพื่อการอนุรักษ์สิ่งแวดล้อม', 'บริหารและพัฒนาฯ (GENCO)');
 const typeLabel = t => t ? `${t.code} · ${t.name}` : '—';
 const lvName = { ok: 'ปกติ', warn: 'ใกล้เต็มโควตา', over: 'เกินโควตา' };
-// Weight text: up to 2 decimals, > 0 (also checked by the server).
-const parseKg = v => { const s = String(v ?? '').replace(/,/g, '').trim(); return /^\d+(\.\d{1,2})?$/.test(s) ? Number(s) : NaN; };
 
 /* ---------- container illustrations (inline SVG) ---------- */
 function containerSVG(k, mono = false) {
@@ -385,7 +357,7 @@ function countUp(root = view) {
     const to = +el.dataset.count, dec = +(el.dataset.dec || 0), t0 = performance.now(), dur = reduceMotion() ? 1 : 1200;
     const step = t => {
       const p = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - p, 4);
-      el.textContent = fmt(p < 1 ? to * e : to, dec);
+      el.textContent = fmtFix(p < 1 ? to * e : to, dec);
       if (p < 1) requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
@@ -412,7 +384,29 @@ $('#navOverlay').onclick = () => $('#sidebar').classList.remove('open');
 function paintUser() {
   $('#userName').textContent = S.user || 'ระบุชื่อผู้ใช้';
   $('#userAv').innerHTML = S.user ? esc(S.user.trim().charAt(0)) : '<i class="fa-solid fa-user"></i>';
-  $('#userChip').classList.toggle('need', !S.user);
+  // viewers never record anything: the name is only nudged for staff / admin
+  $('#userChip').classList.toggle('need', !S.user && can('staff'));
+}
+/* แสดง / ซ่อนเมนูและปุ่มตามสิทธิ์ (เซิร์ฟเวอร์ตรวจสิทธิ์ซ้ำทุกคำสั่งอยู่แล้ว) */
+function paintRole() {
+  const r = S.sess ? S.sess.role : '';
+  $$('.nav [data-role]').forEach(el => { el.hidden = !can(el.dataset.role); });
+  $('#roleTag').innerHTML = r ? `<i class="fa-solid ${ROLE_IC[r]}"></i>${ROLE_TH[r]}` : '';
+  $('#roleTag').className = 'role-tag r-' + (r || 'none');
+  $('#userBox').hidden = !r;
+  document.body.dataset.level = r; // not data-role: that marks the elements shown by level
+  paintUser();
+  paintTreat();
+}
+function paintTreat() {
+  const admin = can('admin'), on = treatOn();
+  $('#treatNav').hidden = !on;
+  const b = $('#treatLock');
+  b.hidden = !admin;
+  b.classList.toggle('on', on);
+  b.innerHTML = `<i class="fa-solid ${on ? 'fa-lock-open' : 'fa-lock'}"></i>`;
+  b.title = on ? 'กำลังแสดงข้อมูลภายใน — คลิกเพื่อซ่อนบนหน้าจอ' : 'แสดงข้อมูลภายใน (ผู้ดูแลระบบ)';
+  document.body.classList.toggle('treat-on', on);
 }
 // required = opened because a save needs a name: keep the form, resolve when closed.
 function askUserName(required = false) {
@@ -437,9 +431,16 @@ function askUserName(required = false) {
   });
 }
 $('#userChip').onclick = () => askUserName(false);
-paintUser();
-$('#treatLock').onclick = async () => { if (S.tt) lockTreat(); else if (await unlockTreat()) route(); };
-paintTreat();
+$('#logoutBtn').onclick = () => { if (confirm('ออกจากระบบ?')) logout(); };
+$('#treatLock').onclick = () => {
+  if (!can('admin')) return;
+  S.hideT = !S.hideT;
+  ss('set', HT_KEY, S.hideT ? '1' : '0');
+  rcClear(); paintTreat();
+  toast(S.hideT ? 'ซ่อนข้อมูลภายในบนหน้าจอแล้ว' : 'แสดงข้อมูลภายในแล้ว', 'info');
+  if (!treatOn() && currentPage() === 'treat') location.hash = 'dashboard'; else route();
+};
+paintRole();
 
 /* ================= ROUTER ================= */
 const monthFirst = () => nowParts().date.slice(0, 8) + '01';
@@ -457,17 +458,17 @@ const PAGE_FN = {
 view.addEventListener('pointerdown', e => { if (e.target.closest('button, input, select, textarea, label, .ccard, .tpick')) S.dirty = true; }, true);
 const sigOf = res => JSON.stringify(res.map((d, i) => (i ? d : { ...d, now: null })));
 let routeSeq = 0;
-const PW_PAGES = ['logs', 'settings'];
+// the lowest role that may open each page (the server checks every action again)
+const PAGE_ROLE = { store: 'staff', ship: 'staff', treat: 'admin', logs: 'admin', settings: 'admin' };
 const NAME_PAGES = ['store', 'ship', 'treat'];
 const INPUT_PAGES = ['store', 'ship', 'treat', 'history', 'settings'];
 async function route() {
   const p = currentPage();
-  if (p === 'treat' && !S.tt) {
-    if (!(await unlockTreat())) { if (currentPage() === p) location.hash = 'dashboard'; return; }
-  }
-  if (PW_PAGES.includes(p)) {
-    try { await askPassword(); }
-    catch (e) { toast(e.message, 'err'); if (currentPage() === p) location.hash = 'dashboard'; return; }
+  if (!S.sess) { showLogin(); return; }
+  if (!can(PAGE_ROLE[p] || 'viewer') || (p === 'treat' && !treatOn())) {
+    if (p !== 'treat' || !can('admin')) toast(`สิทธิ์ “${ROLE_TH[S.sess.role]}” เปิดหน้านี้ไม่ได้`, 'err');
+    location.hash = 'dashboard';
+    return;
   }
   if (NAME_PAGES.includes(p) && !S.user) {
     await askUserName(true);
@@ -559,17 +560,17 @@ function tlItem(m) {
   const t = typeById(m.type_id) || {}, k = KIND[m.kind] || KIND.store;
   return `<div class="tl-item"><div class="ti" style="--c:${k.c}"><i class="fa-solid ${k.icon}"></i></div>
     <div class="tx"><b>${esc(t.name || '—')}</b><small>${k.short} · ${esc(m.doc_no)} · ${dtTH(m.moved_at)} · ${esc(m.actor || '')}</small></div>
-    <div class="kg ${k.cls}">${k.sign}${fmtKg(m.weight_kg)} กก.</div></div>`;
+    <div class="kg ${k.cls}">${k.sign}${fmtT(m.weight_kg)} ตัน</div></div>`;
 }
 function alertItem(a) {
   const t = typeById(a.type_id) || {};
   if (a.kind === 'quota') {
     return `<div class="alert ${a.level === 'bad' ? 'bad' : ''}"><div class="ai"><i class="fa-solid ${a.level === 'bad' ? 'fa-circle-exclamation' : 'fa-triangle-exclamation'}"></i></div>
       <p><b>${esc(t.code)} ${esc(t.name)}</b> ${a.level === 'bad' ? 'ส่งกำจัดเกินปริมาณที่ได้รับอนุญาต' : 'ใช้โควตาใกล้เต็ม'} — ${fmt(a.pct, 1)}%<br>
-      <small>${fmtKg(a.used_kg)} / ${fmtKg(a.permit_kg)} กก. · ${esc(shortRecv(t.receiver))}</small></p></div>`;
+      <small>${fmtT(a.used_kg)} / ${fmtT(a.permit_kg)} ตัน · ${esc(shortRecv(t.receiver))}</small></p></div>`;
   }
   return `<div class="alert"><div class="ai"><i class="fa-solid fa-hourglass-half"></i></div>
-    <p><b>${esc(t.code)} ${esc(t.name)}</b> จัดเก็บในโรงงานนาน ${fmt(a.days)} วัน<br><small>ล็อตเก่าสุดตั้งแต่ ${dateTH(a.since)} · คงเหลือ ${fmtKg(a.balance_kg)} กก.</small></p></div>`;
+    <p><b>${esc(t.code)} ${esc(t.name)}</b> จัดเก็บในโรงงานนาน ${fmt(a.days)} วัน<br><small>ล็อตเก่าสุดตั้งแต่ ${dateTH(a.since)} · คงเหลือ ${fmtT(a.balance_kg)} ตัน</small></p></div>`;
 }
 async function dashboard(d) {
   const k = d.kpi;
@@ -578,16 +579,16 @@ async function dashboard(d) {
   const withBal = S.types.filter(t => balOf(t.id).balance_kg > 0).length;
   const lv = k.quota_pct == null ? 'ok' : k.quota_pct > 100 ? 'over' : k.quota_pct >= (S.limits.quotaWarnPct || 80) ? 'warn' : 'ok';
   const kpis = [
-    ['คงเหลือในโรงงานรวม', k.balance_kg, 'กก.', 2, 'fa-warehouse', '#059669', `≈ ${fmtT(k.balance_kg)} ตัน · ${withBal} ประเภท`],
-    ['จัดเก็บเดือนนี้', k.month_in_kg, 'กก.', 2, 'fa-box-archive', '#14B8A6', `ทั้งปี ${fmtT(k.year_in_kg)} ตัน`],
-    ['ส่งกำจัดปีนี้', k.year_out_kg, 'กก.', 2, 'fa-truck-arrow-right', '#F97316', `เดือนนี้ ${fmtKg(k.month_out_kg)} กก.`],
+    ['คงเหลือในโรงงานรวม', k.balance_kg / 1000, 'ตัน', 3, 'fa-warehouse', '#059669', `${withBal} ประเภทที่มีคงเหลือ`],
+    ['จัดเก็บเดือนนี้', k.month_in_kg / 1000, 'ตัน', 3, 'fa-box-archive', '#14B8A6', `ทั้งปี ${fmtT(k.year_in_kg)} ตัน`],
+    ['ส่งกำจัดปีนี้', k.year_out_kg / 1000, 'ตัน', 3, 'fa-truck-arrow-right', '#F97316', `เดือนนี้ ${fmtT(k.month_out_kg)} ตัน`],
     ['% โควตาที่ใช้ (ปีนี้)', k.quota_pct || 0, '%', 1, 'fa-chart-pie', lv === 'over' ? '#EF4444' : lv === 'warn' ? '#F59E0B' : '#6366F1', `${fmtT(k.year_out_kg)} / ${fmtT(k.permit_kg)} ตัน`],
   ];
   const withPermit = S.types.filter(t => +t.active === 1 || balOf(t.id).balance_kg > 0);
   const cc = d.containers || {};
   const cTotal = CONT_KEYS.reduce((a, c) => a + (cc[c] || 0), 0);
   view.innerHTML = `
-  <div class="reset-topbar"><a class="btn btn-primary btn-sm" href="#store"><i class="fa-solid fa-box-archive"></i>บันทึกจัดเก็บ</a><a class="btn btn-ship btn-sm" href="#ship"><i class="fa-solid fa-truck-arrow-right"></i>ส่งกำจัด</a>${treatOn() ? '<a class="btn btn-treat btn-sm" href="#treat"><i class="fa-solid fa-flask-vial"></i>บำบัดเอง</a>' : ''}<button class="btn btn-bad btn-sm" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button></div>
+  ${can('staff') ? `<div class="reset-topbar"><a class="btn btn-primary btn-sm" href="#store"><i class="fa-solid fa-box-archive"></i>บันทึกจัดเก็บ</a><a class="btn btn-ship btn-sm" href="#ship"><i class="fa-solid fa-truck-arrow-right"></i>ส่งกำจัด</a>${treatOn() ? '<a class="btn btn-treat btn-sm" href="#treat"><i class="fa-solid fa-flask-vial"></i>ข้อมูลภายใน</a>' : ''}${can('admin') ? '<button class="btn btn-bad btn-sm" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button>' : ''}</div>` : ''}
   <div class="hero">
     <div class="hero-orb" aria-hidden="true"><span class="o1"></span><span class="o2"></span><span class="o3"><i class="fa-solid fa-recycle"></i></span>
       <span class="sat"><b><i class="fa-solid fa-leaf"></i></b></span><span class="sat s2"><b><i class="fa-solid fa-droplet"></i></b></span><span class="sat s3"><b><i class="fa-solid fa-seedling"></i></b></span></div>
@@ -607,10 +608,10 @@ async function dashboard(d) {
   ${k.treated_kg !== undefined ? treatSummary(k) : ''}
 
   <div class="grid g-2 mt">
-    <div class="card"><h3><i class="fa-solid fa-chart-column"></i>ปริมาณจัดเก็บ / ส่งกำจัด 12 เดือน<span class="sub">กิโลกรัม</span></h3><div class="chart-box"><canvas id="cMonths"></canvas></div></div>
+    <div class="card"><h3><i class="fa-solid fa-chart-column"></i>ปริมาณจัดเก็บ / ส่งกำจัด 12 เดือน<span class="sub">ตัน</span></h3><div class="chart-box"><canvas id="cMonths"></canvas></div></div>
     <div class="card"><h3><i class="fa-solid fa-gauge-high"></i>โควตารวมปีนี้<span class="sub">เทียบปริมาณที่ได้รับอนุญาต</span></h3>
       <div class="gauge-wrap">${needleGauge(k.quota_pct || 0)}<div class="gauge-val"><span data-count="${k.quota_pct || 0}" data-dec="1">0</span><small>%</small></div>
-      <div class="gauge-sub">ส่งกำจัดแล้ว ${fmtKg(k.year_out_kg)} กก. จาก ${fmtKg(k.permit_kg)} กก.<br><span class="tag lv-${lv}">${lvName[lv]}</span></div></div></div>
+      <div class="gauge-sub">ส่งกำจัดแล้ว ${fmtT(k.year_out_kg)} ตัน จาก ${fmtT(k.permit_kg)} ตัน<br><span class="tag lv-${lv}">${lvName[lv]}</span></div></div></div>
   </div>
 
   <div class="sec-h"><i class="fa-solid fa-circle-notch fa-spin" style="color:var(--brand);--fa-animation-duration:3s"></i>การใช้โควตาแยกประเภท <small>ส่งกำจัดปีนี้ / ปริมาณที่ได้รับอนุญาต</small></div>
@@ -628,10 +629,10 @@ async function dashboard(d) {
     <div class="card"><h3><i class="fa-solid fa-bell"></i>แจ้งเตือน<span class="sub">โควตา ≥ ${S.limits.quotaWarnPct || 80}% · จัดเก็บเกิน ${S.limits.storageAlertDays || 90} วัน</span></h3>
       <div class="alerts">${(d.alerts || []).length ? d.alerts.map(alertItem).join('') : '<div class="all-good"><i class="fa-solid fa-recycle"></i><div><b>ทุกอย่างปกติ</b><br><small>ไม่มีประเภทใดใกล้เต็มโควตาหรือจัดเก็บนานเกินกำหนด</small></div></div>'}</div></div>
     <div class="card"><h3><i class="fa-solid fa-clock-rotate-left"></i>รายการล่าสุด<span class="sub"><a href="#history" style="color:var(--brand2)">ดูทั้งหมด →</a></span></h3>
-      <div class="tl">${(d.recent || []).length ? d.recent.map(tlItem).join('') : '<div class="empty"><i class="fa-solid fa-inbox"></i>ยังไม่มีรายการ — เริ่มที่ “บันทึกจัดเก็บ” หรือบันทึก “ยอดยกมา”</div>'}</div></div>
+      <div class="tl">${(d.recent || []).length ? d.recent.map(tlItem).join('') : `<div class="empty"><i class="fa-solid fa-inbox"></i>ยังไม่มีรายการ${can('staff') ? ' — เริ่มที่ “บันทึกจัดเก็บ” หรือบันทึก “ยอดยกมา”' : ''}</div>`}</div></div>
   </div>`;
   view.onclick = e => { const g = e.target.closest('[data-go]'); if (g) location.hash = g.dataset.go; };
-  $('#resetBtn').onclick = resetData;
+  if ($('#resetBtn')) $('#resetBtn').onclick = resetData;
   // animate rings + needle after the first paint
   requestAnimationFrame(() => requestAnimationFrame(() => {
     $$('.ring-card', view).forEach(el => el.style.setProperty('--p', el.dataset.p));
@@ -640,26 +641,26 @@ async function dashboard(d) {
   }));
   drawDashCharts(d);
 }
-/* ของเสียทั้งหมด = บำบัดเอง + ส่งกำจัด + คงเหลือ (สะสม) — แสดงเฉพาะตอนปลดล็อก */
+/* ของเสียทั้งหมด = ข้อมูลภายใน + ส่งกำจัด + คงเหลือ (สะสม) — เฉพาะผู้ดูแลระบบ (ไม่ได้ซ่อน) */
 function treatSummary(k) {
   const tot = k.total_in_kg || 0, pc = v => tot > 0 ? Math.max(0, v / tot * 100) : 0;
   const parts = [
-    ['บำบัดเอง', k.treated_kg, 'fa-flask-vial', 'var(--treat)', 'treat', `ปีนี้ ${fmtT(k.year_treat_kg)} ตัน · เดือนนี้ ${fmtKg(k.month_treat_kg)} กก.`],
+    ['ข้อมูลภายใน', k.treated_kg, 'fa-flask-vial', 'var(--treat)', 'treat', `ปีนี้ ${fmtT(k.year_treat_kg)} ตัน · เดือนนี้ ${fmtT(k.month_treat_kg)} ตัน`],
     ['ส่งกำจัด (ตัดโควตา)', k.shipped_kg, 'fa-truck-arrow-right', 'var(--out)', 'ship', `ปีนี้ ${fmtT(k.year_out_kg)} / ${fmtT(k.permit_kg)} ตัน · ${fmt(k.quota_pct || 0, 1)}%`],
-    ['คงเหลือในโรงงาน', k.balance_kg, 'fa-warehouse', 'var(--brand)', 'bal', 'รอส่งกำจัด / บำบัด'],
+    ['คงเหลือในโรงงาน', k.balance_kg, 'fa-warehouse', 'var(--brand)', 'bal', 'รอส่งกำจัด'],
   ];
   return `<div class="card mt tsum">
-    <h3><i class="fa-solid fa-flask-vial brew"></i>ของเสียทั้งหมดในระบบ (สะสม)<span class="sub"><i class="fa-solid fa-lock-open"></i> ข้อมูลบำบัดเอง · แท็บนี้เท่านั้น</span></h3>
+    <h3><i class="fa-solid fa-flask-vial brew"></i>ของเสียทั้งหมดในระบบ (สะสม)<span class="sub"><i class="fa-solid fa-lock-open"></i> ข้อมูลภายใน · ผู้ดูแลระบบ</span></h3>
     <div class="tsum-row">
       <div class="tsum-total"><div class="treat-ic" aria-hidden="true"><span class="tr"></span><span class="tc"><i class="fa-solid fa-recycle"></i></span></div>
-        <div><small>ของเสียทั้งหมด (จัดเก็บ + ยอดยกมา)</small><b><span data-count="${tot}" data-dec="2">0</span> <em>กก.</em></b><small>≈ ${fmtT(tot)} ตัน</small></div></div>
+        <div><small>ของเสียทั้งหมด (จัดเก็บ + ยอดยกมา)</small><b><span data-count="${tot / 1000}" data-dec="3">0</span> <em>ตัน</em></b><small>= ${fmtKgHint(tot)} กก.</small></div></div>
       <div class="tsum-parts">${parts.map(([l, v, ic, c, cls, sub]) => `<div class="tpart ${cls}" style="--c:${c}">
         <div class="tp-h"><span class="tp-ic"><i class="fa-solid ${ic}"></i></span><span class="tp-l">${l}</span><i class="pc">${fmt(pc(v), 1)}%</i></div>
-        <b><span data-count="${v}" data-dec="2">0</span> <em>กก.</em></b><small class="tp-s" title="${esc(sub)}">${sub}</small></div>`).join('')}</div>
+ <b><span data-count="${v / 1000}" data-dec="3">0</span> <em>ตัน</em></b><small class="tp-s" title="${esc(sub)}">${sub}</small></div>`).join('')}</div>
     </div>
-    <div class="tbar" role="img" aria-label="สัดส่วน บำบัดเอง ${fmt(pc(k.treated_kg), 1)}% ส่งกำจัด ${fmt(pc(k.shipped_kg), 1)}% คงเหลือ ${fmt(pc(k.balance_kg), 1)}%">
+    <div class="tbar" role="img" aria-label="สัดส่วน ข้อมูลภายใน ${fmt(pc(k.treated_kg), 1)}% ส่งกำจัด ${fmt(pc(k.shipped_kg), 1)}% คงเหลือ ${fmt(pc(k.balance_kg), 1)}%">
       <span class="treat" style="width:${pc(k.treated_kg)}%"></span><span class="ship" style="width:${pc(k.shipped_kg)}%"></span><span class="bal" style="width:${pc(k.balance_kg)}%"></span></div>
-    <p class="hint" style="margin-top:8px"><i class="fa-solid fa-circle-info"></i> โควตาตามหนังสืออนุญาต สก.2 นับเฉพาะ “ส่งกำจัด” — การบำบัดเองภายในโรงงานไม่ตัดโควตา</p>
+    <p class="hint" style="margin-top:8px"><i class="fa-solid fa-circle-info"></i> โควตาตามหนังสืออนุญาต สก.2 นับเฉพาะ “ส่งกำจัด” — ข้อมูลภายในไม่ตัดโควตา</p>
   </div>`;
 }
 function drawDashCharts(d) {
@@ -677,13 +678,13 @@ function drawDashCharts(d) {
     S.charts.push(new Chart(cm, {
       type: 'bar',
       data: { labels: lbl, datasets: [
-        { label: 'จัดเก็บ (กก.)', data: d.months.map(m => m.in_kg), backgroundColor: g, borderRadius: 8, maxBarThickness: 26 },
-        { label: 'ส่งกำจัด (กก.)', data: d.months.map(m => m.out_kg), backgroundColor: g2, borderRadius: 8, maxBarThickness: 26 },
-        ...(d.months[0] && d.months[0].treat_kg !== undefined ? [{ label: 'บำบัดเอง (กก.)', data: d.months.map(m => m.treat_kg), backgroundColor: g3(cm), borderRadius: 8, maxBarThickness: 26 }] : []),
+        { label: 'จัดเก็บ (ตัน)', data: d.months.map(m => m.in_kg / 1000), backgroundColor: g, borderRadius: 8, maxBarThickness: 26 },
+        { label: 'ส่งกำจัด (ตัน)', data: d.months.map(m => m.out_kg / 1000), backgroundColor: g2, borderRadius: 8, maxBarThickness: 26 },
+        ...(d.months[0] && d.months[0].treat_kg !== undefined ? [{ label: 'ข้อมูลภายใน (ตัน)', data: d.months.map(m => m.treat_kg / 1000), backgroundColor: g3(cm), borderRadius: 8, maxBarThickness: 26 }] : []),
       ] },
       options: { responsive: true, maintainAspectRatio: false, animation: { duration: reduceMotion() ? 0 : 1200, easing: 'easeOutQuart' },
-        plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle' } }, tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtKg(c.parsed.y)}` } } },
-        scales: { x: { grid: { display: false } }, y: { beginAtZero: true, grid: { color: 'rgba(6,78,59,.06)' }, ticks: { callback: v => fmt(v) } } } },
+        plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle' } }, tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtFix(c.parsed.y, 3)}` } } },
+        scales: { x: { grid: { display: false } }, y: { beginAtZero: true, grid: { color: 'rgba(6,78,59,.06)' }, ticks: { callback: v => fmt(v, 3) } } } },
     }));
   }
   const cc = $('#cCont');
@@ -712,10 +713,12 @@ function typePicker(sel, mode, q) {
       return `<button type="button" class="tpick ${+t.id === +sel ? 'sel' : ''}" data-type="${t.id}" style="--c:${esc(t.color)}" ${off ? 'disabled' : ''}>
         <span class="ti"><i class="fa-solid ${esc(t.icon)}"></i></span>
         <span class="tt"><b>${esc(t.name)}</b><small><span class="code">${esc(t.code)}</span> · จัดการ ${esc(t.mgmt_code)}</small>
-        <span class="bal">${off ? 'ไม่มีคงเหลือ' : 'คงเหลือ ' + fmtKg(b.balance_kg) + ' กก.'}</span></span></button>`;
+        <span class="bal">${off ? 'ไม่มีคงเหลือ' : 'คงเหลือ ' + fmtT(b.balance_kg) + ' ตัน'}</span></span></button>`;
     }).join('')}</div></div>`;
   }).join('');
 }
+// quick-add buttons (tons)
+const QUICK_T = [0.1, 0.5, 1, 5, 10];
 const TREAT_METHODS = ['ระบบบำบัดน้ำเสียภายในโรงงาน', 'เตาเผาภายในโรงงาน', 'ระบบปรับเสถียร / ทำให้เป็นของแข็ง', 'ระบบคัดแยก / รีไซเคิลภายในโรงงาน'];
 function txForm(page) {
   const n = nowParts();
@@ -726,7 +729,7 @@ function txForm(page) {
   view.innerHTML = `<div class="wizard ${ship ? 'ship-mode' : treat ? 'treat-mode' : ''}">
     <div class="steps">
       ${treat ? `<div class="treat-note"><div class="treat-ic sm" aria-hidden="true"><span class="tr"></span><span class="tc"><i class="fa-solid fa-flask-vial"></i></span></div>
-        <div><b>บำบัดเองภายในโรงงาน</b><small>ตัดยอดคงเหลือในโรงงานเหมือนส่งกำจัด (ไม่เกินยอดคงเหลือ / จำนวนภาชนะ) แต่ <u>ไม่นับ</u> โควตาตามหนังสืออนุญาต สก.2 · แสดงเฉพาะโหมดปลดล็อก</small></div></div>` : ''}
+        <div><b>ข้อมูลภายใน</b><small>ตัดยอดคงเหลือในโรงงานเหมือนส่งกำจัด (ไม่เกินยอดคงเหลือ / จำนวนภาชนะ) แต่ <u>ไม่นับ</u> โควตาตามหนังสืออนุญาต สก.2 · เฉพาะผู้ดูแลระบบ</small></div></div>` : ''}
       ${out ? '' : `<div class="seg" id="modeSeg"><button type="button" data-mode="store" class="on"><i class="fa-solid fa-box-archive"></i>บันทึกจัดเก็บ</button><button type="button" data-mode="opening"><i class="fa-solid fa-flag-checkered"></i>ยอดยกมา (Opening balance)</button></div>
         <p class="hint" id="modeHint" style="margin-top:-8px"></p>`}
       <div class="card"><div class="step-h"><span class="n">1</span><h3>เลือกประเภทของเสีย</h3><span class="sub">${S.types.length} ประเภท · แยกตามผู้รับดำเนินการ</span></div>
@@ -734,10 +737,10 @@ function txForm(page) {
         <div id="tPick"></div></div>
       <div class="card"><div class="step-h"><span class="n">2</span><h3>น้ำหนัก &amp; ภาชนะบรรจุ</h3></div>
         <div id="liveBal"></div>
-        <div class="field"><label>น้ำหนัก (กิโลกรัม) · ทศนิยมไม่เกิน 2 ตำแหน่ง</label>
-          <div class="weight-box" id="wBox"><input id="fW" inputmode="decimal" autocomplete="off" placeholder="0.00"><span>กก.</span></div>
+        <div class="field"><label>น้ำหนัก (ตัน) · ทศนิยม 3 ตำแหน่ง = 1 กก. เช่น 0.125 ตัน = 125 กก.</label>
+          <div class="weight-box" id="wBox"><input id="fW" inputmode="decimal" autocomplete="off" placeholder="0.000"><span>ตัน</span></div>
           <div class="weight-help" id="wHelp">&nbsp;</div>
-          <div class="quick" id="wQuick">${[5, 10, 50, 100, 500].map(v => `<button type="button" data-add="${v}">+${v}</button>`).join('')}<button type="button" data-add="0">ล้าง</button>${out ? '<button type="button" data-all="1">ทั้งหมดที่คงเหลือ</button>' : ''}</div></div>
+          <div class="quick" id="wQuick">${QUICK_T.map(v => `<button type="button" data-add="${v}">+${v}</button>`).join('')}<button type="button" data-add="0">ล้าง</button>${out ? '<button type="button" data-all="1">ทั้งหมดที่คงเหลือ</button>' : ''}</div></div>
         <div class="field mt"><label>ภาชนะบรรจุ</label><div class="ccards" id="cCards"></div></div>
         <div class="field mt"><label>จำนวนภาชนะ</label><div class="stepper"><button type="button" data-step="-1" aria-label="ลด"><i class="fa-solid fa-minus"></i></button><input id="fN" inputmode="numeric" value="1"><button type="button" data-step="1" aria-label="เพิ่ม"><i class="fa-solid fa-plus"></i></button></div><div class="weight-help" id="nHelp"></div></div>
       </div>
@@ -747,7 +750,7 @@ function txForm(page) {
           <div class="field"><label>เวลา</label><input type="time" id="fTime" value="${F.time}"></div>
           ${ship ? `<div class="field"><label>เลขที่ใบกำกับการขนส่ง (Manifest) — ไม่บังคับ</label><input id="fMan" maxlength="60" placeholder="เช่น MN-2569-000123"></div>
             <div class="field"><label>ทะเบียนรถ — ไม่บังคับ</label><input id="fVeh" maxlength="40" placeholder="เช่น 70-1234 ชลบุรี"></div>`
-            : treat ? `<div class="field full"><label>วิธีบำบัด / ระบบ — ไม่บังคับ</label><input id="fMeth" maxlength="120" list="methList" value="${esc(F.method)}" placeholder="เช่น ระบบบำบัดน้ำเสียภายในโรงงาน"><datalist id="methList">${TREAT_METHODS.map(m => `<option value="${esc(m)}">`).join('')}</datalist></div>`
+            : treat ? `<div class="field full"><label>ระบบ / วิธีการ — ไม่บังคับ</label><input id="fMeth" maxlength="120" list="methList" value="${esc(F.method)}" placeholder="เช่น ระบบบำบัดน้ำเสียภายในโรงงาน"><datalist id="methList">${TREAT_METHODS.map(m => `<option value="${esc(m)}">`).join('')}</datalist></div>`
             : `<div class="field full"><label>สถานที่จัดเก็บ — ไม่บังคับ</label><input id="fLoc" maxlength="100" placeholder="เช่น โรงเก็บของเสียอันตราย A"></div>`}
           <div class="field full"><label>หมายเหตุ</label><textarea id="fNote" rows="2" maxlength="255"></textarea></div>
         </div></div>
@@ -768,16 +771,16 @@ function txForm(page) {
   let busy = false; // a save is in flight: the button stays disabled even if the summary is redrawn
   const errs = () => {
     const e = {};
-    const w = parseKg(F.weight);
+    const w = parseT(F.weight);
     if (!F.type_id) e.type = 'กรุณาเลือกประเภทของเสีย';
-    if (F.weight === '') e.w = 'กรุณากรอกน้ำหนัก';
-    else if (isNaN(w)) e.w = 'น้ำหนักต้องเป็นตัวเลข ทศนิยมไม่เกิน 2 ตำแหน่ง';
+    if (F.weight === '') e.w = 'กรุณากรอกน้ำหนัก (ตัน)';
+    else if (isNaN(w)) e.w = 'น้ำหนักต้องเป็นตัวเลข (ตัน) เช่น 0.125';
     else if (!(w > 0)) e.w = 'น้ำหนักต้องมากกว่า 0';
     if (!F.container) e.c = 'กรุณาเลือกภาชนะ';
     if (!/^\d+$/.test(String(F.containers)) || +F.containers < 1) e.n = 'จำนวนภาชนะต้องเป็นจำนวนเต็มตั้งแต่ 1';
     if (out && F.type_id) { // stock-out forms only (ship / treat): not more than what is in the plant
       const b = balOf(F.type_id);
-      if (!e.w && w > b.balance_kg + 1e-9) e.w = `เกินยอดคงเหลือ (${fmtKg(b.balance_kg)} กก.)`;
+      if (!e.w && w > b.balance_kg + 1e-9) e.w = `เกินยอดคงเหลือ (${fmtT(b.balance_kg)} ตัน)`;
       if (F.container && !e.n && +F.containers > (b.containers[F.container] || 0)) e.n = `${CONT[F.container].name}ในคลังมี ${fmt(b.containers[F.container] || 0)} ภาชนะ`;
     }
     return e;
@@ -785,33 +788,33 @@ function txForm(page) {
   const live = () => {
     const t = typeById(F.type_id), box = $('#liveBal');
     if (!t) { box.innerHTML = ''; return; }
-    const b = balOf(t.id), w = parseKg(F.weight) || 0, after = out ? b.balance_kg - w : b.balance_kg + w;
+    const b = balOf(t.id), w = parseT(F.weight) || 0, after = Math.round((out ? b.balance_kg - w : b.balance_kg + w) * 100) / 100;
     box.innerHTML = `<div class="live-bal ${out && after < -1e-9 ? 'low' : ''}"><span class="lb-ic"><i class="fa-solid fa-scale-balanced"></i></span>
-      <div><small>คงเหลือในโรงงานตอนนี้ · ${esc(t.name)}</small><b>${fmtKg(b.balance_kg)}</b> กก. <small>หลังบันทึก ≈ ${fmtKg(after)} กก. · ${CONT_KEYS.map(k => `${CONT[k].name} ${fmt(b.containers[k] || 0)}`).join(' · ')}</small></div></div>`;
+      <div><small>คงเหลือในโรงงานตอนนี้ · ${esc(t.name)}</small><b>${fmtT(b.balance_kg)}</b> ตัน <small>หลังบันทึก ${fmtT(after)} ตัน · ${CONT_KEYS.map(k => `${CONT[k].name} ${fmt(b.containers[k] || 0)}`).join(' · ')}</small></div></div>`;
   };
   const summary = () => {
-    const t = typeById(F.type_id), e = errs(), w = parseKg(F.weight), k = KIND[F.kind];
+    const t = typeById(F.type_id), e = errs(), w = parseT(F.weight), k = KIND[F.kind];
     const ok = !Object.keys(e).length;
     $('#sumBox').innerHTML = `${treat ? '<div class="treat-ic sum-ic" aria-hidden="true"><span class="tr"></span><span class="tc"><i class="fa-solid fa-flask-vial"></i></span></div>' : ecoLogo('sum-ic')}
       <h3 style="justify-content:center"><i class="fa-solid ${k.icon}" style="color:${k.c}"></i>${k.name}</h3>
-      <div class="sum-total"><b>${isNaN(w) ? '0' : fmtKg(w)} <small style="font-size:16px">กก.</small></b><small>${isNaN(w) ? '' : '≈ ' + fmtT(w) + ' ตัน'}</small></div>
+      <div class="sum-total"><b>${isNaN(w) ? '0.000' : fmtT(w)} <small style="font-size:16px">ตัน</small></b><small>${isNaN(w) ? '' : '= ' + fmtKgHint(w) + ' กก.'}</small></div>
       <div class="sum-list">
         <div><span>ของเสีย</span><b>${t ? esc(t.name) : '—'}</b></div>
         <div><span>รหัสของเสีย</span><b>${t ? esc(t.code) + ' · จัดการ ' + esc(t.mgmt_code) : '—'}</b></div>
-        ${treat ? `<div><span>วิธีบำบัด / ระบบ</span><b>${esc(F.method || '—')}</b></div>
-        <div><span>โควตา สก.2</span><b style="color:var(--treat)">ไม่นับ (บำบัดภายในโรงงาน)</b></div>`
+        ${treat ? `<div><span>ระบบ / วิธีการ</span><b>${esc(F.method || '—')}</b></div>
+        <div><span>โควตา สก.2</span><b style="color:var(--treat)">ไม่นับ (ข้อมูลภายใน)</b></div>`
           : `<div><span>ผู้รับดำเนินการ</span><b>${t ? esc(t.receiver) : '—'}</b></div>`}
         <div><span>ภาชนะ</span><b>${F.container ? CONT[F.container].name + ' × ' + fmt(F.containers) : '—'}</b></div>
         <div><span>วันที่</span><b>${F.date ? dateTH(F.date) + ' ' + esc(F.time) + ' น.' : '—'}</b></div>
         <div><span>ผู้บันทึก</span><b>${esc(meLabel())}</b></div>
       </div>
-      <button class="btn btn-lg ${ship ? 'btn-ship' : treat ? 'btn-treat' : 'btn-primary'}" id="fGo" ${ok ? '' : 'disabled'}><i class="fa-solid ${ship ? 'fa-truck-arrow-right' : treat ? 'fa-flask-vial' : 'fa-floppy-disk'}"></i>${ship ? 'ยืนยันส่งกำจัด' : treat ? 'ยืนยันบำบัดเอง' : F.kind === 'opening' ? 'บันทึกยอดยกมา' : 'บันทึกจัดเก็บ'}</button>
+      <button class="btn btn-lg ${ship ? 'btn-ship' : treat ? 'btn-treat' : 'btn-primary'}" id="fGo" ${ok ? '' : 'disabled'}><i class="fa-solid ${ship ? 'fa-truck-arrow-right' : treat ? 'fa-flask-vial' : 'fa-floppy-disk'}"></i>${ship ? 'ยืนยันส่งกำจัด' : treat ? 'บันทึกข้อมูลภายใน' : F.kind === 'opening' ? 'บันทึกยอดยกมา' : 'บันทึกจัดเก็บ'}</button>
       <p class="hint" style="margin-top:10px;text-align:center">${ok ? '<i class="fa-solid fa-circle-check" style="color:var(--ok)"></i> พร้อมบันทึก' : esc(Object.values(e)[0])}</p>`;
     $('#fGo').onclick = submit;
     if (busy) { $('#fGo').disabled = true; $('#fGo').innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังบันทึก...'; }
     const we = e.w && F.weight !== '';
     $('#wBox').classList.toggle('bad', !!we);
-    $('#wHelp').textContent = we ? e.w : (out && t ? `${treat ? 'บำบัด' : 'ส่ง'}ได้ไม่เกิน ${fmtKg(balOf(t.id).balance_kg)} กก.` : '\u00a0');
+    $('#wHelp').textContent = we ? e.w : (out && t ? `${treat ? 'ตัดยอด' : 'ส่ง'}ได้ไม่เกิน ${fmtT(balOf(t.id).balance_kg)} ตัน` : '\u00a0');
     $('#wHelp').classList.toggle('bad', !!we);
     $('#nHelp').textContent = e.n || '';
     $('#nHelp').className = 'weight-help' + (e.n ? ' bad' : '');
@@ -829,7 +832,8 @@ function txForm(page) {
     const e = errs();
     if (Object.keys(e).length) { toast(Object.values(e)[0], 'err'); return; }
     busy = true; go.disabled = true; go.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังบันทึก...';
-    const body = { type_id: F.type_id, weight_kg: String(parseKg(F.weight)), container: F.container, containers: String(F.containers), date: F.date, time: F.time, note: F.note };
+    // tons go to the server as typed (the server converts them to kg exactly)
+    const body = { type_id: F.type_id, weight_t: tonsStr(parseT(F.weight)), container: F.container, containers: String(F.containers), date: F.date, time: F.time, note: F.note };
     if (ship) Object.assign(body, { manifest_no: F.manifest_no, vehicle: F.vehicle });
     else if (treat) body.method = F.method;
     else body.location = F.location;
@@ -842,10 +846,10 @@ function txForm(page) {
         <div class="doc">${esc(r.doc_no)}</div>
         <div class="receipt"><div class="sum-list">
           <div><span>ของเสีย</span><b>${esc(typeLabel(t))}</b></div>
-          <div><span>น้ำหนัก</span><b>${fmtKg(body.weight_kg)} กก.</b></div>
+          <div><span>น้ำหนัก</span><b>${fmtT(parseT(body.weight_t))} ตัน</b></div>
           <div><span>ภาชนะ</span><b>${CONT[F.container].name} × ${fmt(F.containers)}</b></div>
-          ${treat && F.method ? `<div><span>วิธีบำบัด / ระบบ</span><b>${esc(F.method)}</b></div>` : ''}
-          <div><span>คงเหลือในโรงงาน</span><b>${fmtKg(r.balance_kg)} กก.</b></div>
+          ${treat && F.method ? `<div><span>ระบบ / วิธีการ</span><b>${esc(F.method)}</b></div>` : ''}
+          <div><span>คงเหลือในโรงงาน</span><b>${fmtT(r.balance_kg)} ตัน</b></div>
           <div><span>ผู้บันทึก</span><b>${esc(S.user)}</b></div></div></div>
         <div class="modal-acts"><a class="btn btn-ghost" href="#balance" data-close><i class="fa-solid fa-scale-balanced"></i>ดูคงเหลือ</a><button class="btn btn-primary" data-close><i class="fa-solid fa-plus"></i>ทำรายการต่อ</button></div>`);
       S.onModalClose = () => route();
@@ -853,7 +857,7 @@ function txForm(page) {
     } catch (err) {
       busy = false;
       toast(err.message, 'err');
-      if (err.code === 'TREAT_LOCKED') { location.hash = 'dashboard'; return; }
+      if (err.code === 'AUTH_REQUIRED') return;
       summary();
     }
   }
@@ -868,11 +872,12 @@ function txForm(page) {
     if (md) { setMode(md.dataset.mode); return; }
     const ad = e.target.closest('[data-add]');
     if (ad) {
-      const v = +ad.dataset.add, cur = parseKg(F.weight) || 0;
-      F.weight = v ? String(Math.round((cur + v) * 100) / 100) : '';
+      // in whole hundredths of a kg: +0.1 t steps never drift
+      const v = +ad.dataset.add, cur = parseT(F.weight) || 0;
+      F.weight = v ? tonsStr(Math.round(cur * 100 + v * 100000) / 100) : '';
       $('#fW').value = F.weight; refresh(); return;
     }
-    if (e.target.closest('[data-all]') && F.type_id) { F.weight = String(balOf(F.type_id).balance_kg); $('#fW').value = F.weight; refresh(); return; }
+    if (e.target.closest('[data-all]') && F.type_id) { F.weight = tonsStr(balOf(F.type_id).balance_kg); $('#fW').value = F.weight; refresh(); return; }
     const st = e.target.closest('[data-step]');
     if (st) { F.containers = Math.max(1, (parseInt(F.containers, 10) || 0) + +st.dataset.step); $('#fN').value = F.containers; refresh(); }
   };
@@ -895,7 +900,7 @@ function txForm(page) {
 /* ================= BALANCE ================= */
 function balance() {
   const days = S.limits.storageAlertDays || 90;
-  // per-type treatment totals: only in the unlocked view (the server sends them only then)
+  // per-type in-house totals: admin only (the server sends them only then)
   const showT = treatOn() && S.types.some(t => balOf(t.id).treated_kg !== undefined);
   let filter = 'all';
   const recv = receivers().map(r => {
@@ -910,13 +915,13 @@ function balance() {
     const b = balOf(t.id), pct = b.quota_pct;
     return `<div class="bcard" style="--c:${esc(t.color)}">
       <div class="bh"><span class="bi"><i class="fa-solid ${esc(t.icon)}"></i></span><div class="bt"><b>${esc(t.name)} ${+t.active === 1 ? '' : '<span class="tag off">ปิดใช้งาน</span>'}</b><small>${esc(t.code)} · จัดการ ${esc(t.mgmt_code)} · ${esc(shortRecv(t.receiver))}</small></div></div>
-      <div class="big"><b data-count="${b.balance_kg}" data-dec="2">0</b><span>กก. คงเหลือ</span></div>
-      <div class="flow"><span><i class="fa-solid fa-arrow-down" style="color:var(--in)"></i> รับเข้า <b>${fmtKg(b.in_kg)}</b></span><span><i class="fa-solid fa-arrow-up" style="color:var(--out)"></i> ส่งกำจัด <b>${fmtKg(b.shipped_kg)}</b></span>${showT && b.treated_kg > 0 ? `<span class="ft"><i class="fa-solid fa-flask-vial"></i> บำบัดเอง <b>${fmtKg(b.treated_kg)}</b></span>` : ''}${b.opening_kg ? `<span>(ยกมา ${fmtKg(b.opening_kg)})</span>` : ''}</div>
+      <div class="big"><b data-count="${b.balance_kg / 1000}" data-dec="3">0</b><span>ตัน คงเหลือ</span></div>
+      <div class="flow"><span><i class="fa-solid fa-arrow-down" style="color:var(--in)"></i> รับเข้า <b>${fmtT(b.in_kg)}</b></span><span><i class="fa-solid fa-arrow-up" style="color:var(--out)"></i> ส่งกำจัด <b>${fmtT(b.shipped_kg)}</b></span>${showT && b.treated_kg > 0 ? `<span class="ft"><i class="fa-solid fa-flask-vial"></i> ข้อมูลภายใน <b>${fmtT(b.treated_kg)}</b></span>` : ''}${b.opening_kg ? `<span>(ยกมา ${fmtT(b.opening_kg)})</span>` : ''}</div>
       <div class="cchips">${CONT_KEYS.map(k => `<span class="cchip ${b.containers[k] ? '' : 'zero'}">${containerSVG(k)}${CONT[k].name} <b>${fmt(b.containers[k])}</b></span>`).join('')}</div>
-      <div class="qline"><span>ส่งกำจัดปีนี้ <b>${fmtKg(b.shipped_year_kg)}</b> / ${fmtKg(b.permit_kg)} กก.</span><span class="tag lv-${b.quota_level}">${pct == null ? '—' : fmt(pct, 1) + '%'}</span></div>
+      <div class="qline"><span>ส่งกำจัดปีนี้ <b>${fmtT(b.shipped_year_kg)}</b> / ${fmtT(b.permit_kg)} ตัน</span><span class="tag lv-${b.quota_level}">${pct == null ? '—' : fmt(pct, 1) + '%'}</span></div>
       <div class="qbar ${b.quota_level}"><span style="width:${Math.min(100, pct || 0)}%"></span></div>
       ${b.age_days != null ? `<span class="agepill ${b.age_days > days ? 'old' : ''}"><i class="fa-solid fa-hourglass-half"></i>ล็อตเก่าสุด ${fmt(b.age_days)} วัน (ตั้งแต่ ${dateTH(b.oldest_at)})</span>` : ''}
-      <div class="rec-acts" style="margin-top:10px;justify-content:flex-end"><a class="btn btn-sm btn-ghost" href="#store?type=${t.id}"><i class="fa-solid fa-box-archive"></i>จัดเก็บ</a>${b.balance_kg > 0 ? `<a class="btn btn-sm btn-ship" href="#ship?type=${t.id}"><i class="fa-solid fa-truck-arrow-right"></i>ส่งกำจัด</a>` : ''}${showT && b.balance_kg > 0 ? `<a class="btn btn-sm btn-treat" href="#treat?type=${t.id}"><i class="fa-solid fa-flask-vial"></i>บำบัด</a>` : ''}</div>
+      ${can('staff') ? `<div class="rec-acts" style="margin-top:10px;justify-content:flex-end"><a class="btn btn-sm btn-ghost" href="#store?type=${t.id}"><i class="fa-solid fa-box-archive"></i>จัดเก็บ</a>${b.balance_kg > 0 ? `<a class="btn btn-sm btn-ship" href="#ship?type=${t.id}"><i class="fa-solid fa-truck-arrow-right"></i>ส่งกำจัด</a>` : ''}${showT && b.balance_kg > 0 ? `<a class="btn btn-sm btn-treat" href="#treat?type=${t.id}"><i class="fa-solid fa-flask-vial"></i>ข้อมูลภายใน</a>` : ''}</div>` : ''}
     </div>`;
   };
   const show = () => {
@@ -933,16 +938,16 @@ function balance() {
     <div class="recv-cards stagger">${recv.map(x => `<div class="rcard"><h4><i class="fa-solid fa-truck-field"></i>${esc(x.r)}</h4>
       <div style="display:flex;align-items:baseline;gap:8px"><span class="pct" style="color:${x.lv === 'over' ? 'var(--bad)' : x.lv === 'warn' ? 'var(--amber2)' : 'var(--brand2)'}">${x.pct == null ? '—' : fmt(x.pct, 1) + '%'}</span><span class="hint">ใช้โควตาปีนี้</span></div>
       <div class="qbar ${x.lv}"><span style="width:${Math.min(100, x.pct || 0)}%"></span></div>
-      <div class="nums"><span>ส่งแล้ว ${fmtT(x.used)} / ${fmtT(x.permit)} ตัน</span><span>คงเหลือในโรงงาน ${fmtKg(x.bal)} กก.</span></div></div>`).join('')}</div>
+      <div class="nums"><span>ส่งแล้ว ${fmtT(x.used)} / ${fmtT(x.permit)} ตัน</span><span>คงเหลือในโรงงาน ${fmtT(x.bal)} ตัน</span></div></div>`).join('')}</div>
     <div class="card mt">
-      <h3><i class="fa-solid fa-scale-balanced"></i>คงเหลือในโรงงานรวม <span style="font-family:Kanit;color:var(--brand2)">${fmtKg(totalBal)} กก.</span><span class="sub">≈ ${fmtT(totalBal)} ตัน</span></h3>
+      <h3><i class="fa-solid fa-scale-balanced"></i>คงเหลือในโรงงานรวม <span style="font-family:Kanit;color:var(--brand2)">${fmtT(totalBal)} ตัน</span><span class="sub">= ${fmtKgHint(totalBal)} กก.</span></h3>
       <div class="seg" id="balSeg"><button data-f="all" class="on">ทั้งหมด</button><button data-f="has">มีคงเหลือ</button><button data-f="alert">ต้องติดตาม (${alertCount().n})</button></div>
     </div>
     <div class="bal-grid mt" id="balGrid"></div>
-    <div class="card mt"><h3><i class="fa-solid fa-table"></i>ตารางสรุปตามหนังสืออนุญาต<span class="sub">ปี ${esc(S.company.permitYear || '')} · หน่วย กก.</span></h3>
-      <div class="tbl-wrap"><table><thead><tr><th>#</th><th>รหัส</th><th>ของเสีย</th><th>จัดการ</th><th>ผู้รับดำเนินการ</th><th class="num">อนุญาต (ตัน)</th><th class="num">รับเข้าสะสม</th><th class="num">ส่งกำจัดสะสม</th>${showT ? '<th class="num th-treat">บำบัดเองสะสม</th>' : ''}<th class="num">คงเหลือ</th><th class="num">ส่งปีนี้</th><th class="num">% โควตา</th></tr></thead><tbody>
+    <div class="card mt"><h3><i class="fa-solid fa-table"></i>ตารางสรุปตามหนังสืออนุญาต<span class="sub">ปี ${esc(S.company.permitYear || '')} · หน่วย ตัน</span></h3>
+      <div class="tbl-wrap"><table><thead><tr><th>#</th><th>รหัส</th><th>ของเสีย</th><th>จัดการ</th><th>ผู้รับดำเนินการ</th><th class="num">อนุญาต (ตัน)</th><th class="num">รับเข้าสะสม</th><th class="num">ส่งกำจัดสะสม</th>${showT ? '<th class="num th-treat">ข้อมูลภายในสะสม</th>' : ''}<th class="num">คงเหลือ</th><th class="num">ส่งปีนี้</th><th class="num">% โควตา</th></tr></thead><tbody>
       ${S.types.map((t, i) => { const b = balOf(t.id); return `<tr><td>${i + 1}</td><td><span class="tcode" style="--c:${esc(t.color)}"><i class="fa-solid ${esc(t.icon)}"></i>${esc(t.code)}</span></td><td>${esc(t.name)}</td><td>${esc(t.mgmt_code)}</td><td>${esc(shortRecv(t.receiver))}</td>
-        <td class="num">${fmt(t.permit_tons, 3)}</td><td class="num">${fmtKg(b.in_kg)}</td><td class="num">${fmtKg(b.shipped_kg)}</td>${showT ? `<td class="num" style="color:var(--treat)">${fmtKg(b.treated_kg)}</td>` : ''}<td class="num"><b>${fmtKg(b.balance_kg)}</b></td><td class="num">${fmtKg(b.shipped_year_kg)}</td><td class="num"><span class="tag lv-${b.quota_level}">${b.quota_pct == null ? '—' : fmt(b.quota_pct, 1) + '%'}</span></td></tr>`; }).join('')}
+        <td class="num">${fmtFix(t.permit_tons, 3)}</td><td class="num">${fmtT(b.in_kg)}</td><td class="num">${fmtT(b.shipped_kg)}</td>${showT ? `<td class="num" style="color:var(--treat)">${fmtT(b.treated_kg)}</td>` : ''}<td class="num"><b>${fmtT(b.balance_kg)}</b></td><td class="num">${fmtT(b.shipped_year_kg)}</td><td class="num"><span class="tag lv-${b.quota_level}">${b.quota_pct == null ? '—' : fmt(b.quota_pct, 1) + '%'}</span></td></tr>`; }).join('')}
       </tbody></table></div></div>`;
   view.onclick = e => { const f = e.target.closest('[data-f]'); if (f) { filter = f.dataset.f; $$('#balSeg button').forEach(b => b.classList.toggle('on', b === f)); show(); } };
   show();
@@ -970,23 +975,23 @@ function historyPage(initial) {
     <div id="hRes">${loader()}</div></div>`;
   const params = () => '&' + new URLSearchParams({ from: $('#hFrom').value, to: $('#hTo').value, type: $('#hType').value, kind: $('#hKind').value, receiver: $('#hRecv').value, q: $('#hQ').value });
   let items = [], loadSeq = 0;
-  const acts = m => `<div class="rec-acts"><button class="btn btn-sm btn-ghost rec-btn" data-medit="${m.id}" title="แก้ไขรายการ">✏️ แก้ไข</button><button class="btn btn-sm btn-ghost rec-btn" data-mdel="${m.id}" title="ลบรายการ">🗑 ลบ</button></div>`;
+  const acts = m => !can('admin') ? '' : `<div class="rec-acts"><button class="btn btn-sm btn-ghost rec-btn" data-medit="${m.id}" title="แก้ไขรายการ">✏️ แก้ไข</button><button class="btn btn-sm btn-ghost rec-btn" data-mdel="${m.id}" title="ลบรายการ">🗑 ลบ</button></div>`;
   const show = () => {
     const tot = k => items.filter(i => i.kind === k).reduce((a, i) => a + Math.round(i.weight_kg * 100), 0) / 100;
     $('#hRes').innerHTML = items.length ? `
-      <div class="chips" style="margin-bottom:12px">${kinds().map(([k, a]) => `<span class="tag k-${k}"><i class="fa-solid ${a.icon}"></i>${a.short} ${fmtKg(tot(k))} กก.</span>`).join('')}<span class="tag off">${fmt(items.length)} รายการ</span></div>
-      <div class="tbl-wrap tbl-desktop" style="max-height:64vh"><table><thead><tr><th>เลขที่เอกสาร</th><th>วันที่ / เวลา</th><th>รายการ</th><th>ของเสีย</th><th>ผู้รับดำเนินการ</th><th class="num">น้ำหนัก (กก.)</th><th>ภาชนะ</th><th>ที่เก็บ / ใบกำกับ</th><th>หมายเหตุ</th><th>ผู้บันทึก</th><th>จัดการ</th></tr></thead><tbody>
+      <div class="chips" style="margin-bottom:12px">${kinds().map(([k, a]) => `<span class="tag k-${k}"><i class="fa-solid ${a.icon}"></i>${a.short} ${fmtT(tot(k))} ตัน</span>`).join('')}<span class="tag off">${fmt(items.length)} รายการ</span></div>
+      <div class="tbl-wrap tbl-desktop" style="max-height:64vh"><table><thead><tr><th>เลขที่เอกสาร</th><th>วันที่ / เวลา</th><th>รายการ</th><th>ของเสีย</th><th>ผู้รับดำเนินการ</th><th class="num">น้ำหนัก (ตัน)</th><th>ภาชนะ</th><th>ที่เก็บ / ใบกำกับ</th><th>หมายเหตุ</th><th>ผู้บันทึก</th>${can('admin') ? '<th>จัดการ</th>' : ''}</tr></thead><tbody>
       ${items.map(m => { const k = KIND[m.kind] || KIND.store; return `<tr><td><b>${esc(m.doc_no)}</b></td><td style="white-space:nowrap">${dtTH(m.moved_at)}</td>
         <td><span class="tag k-${m.kind}"><i class="fa-solid ${k.icon}"></i>${k.short}</span></td>
         <td><span class="tcode" style="--c:${esc(m.color)}"><i class="fa-solid ${esc(m.icon)}"></i><span><b>${esc(m.code)}</b> ${esc(m.type_name)}</span></span></td>
-        <td style="font-size:12.5px">${m.kind === 'treat' ? '<span style="color:var(--treat)">บำบัดภายในโรงงาน</span>' : esc(shortRecv(m.receiver))}</td>
-        <td class="num"><b class="kg ${k.cls}">${k.sign}${fmtKg(m.weight_kg)}</b></td>
+        <td style="font-size:12.5px">${m.kind === 'treat' ? '<span style="color:var(--treat)">ภายในโรงงาน</span>' : esc(shortRecv(m.receiver))}</td>
+        <td class="num"><b class="kg ${k.cls}">${k.sign}${fmtT(m.weight_kg)}</b></td>
         <td style="white-space:nowrap">${CONT[m.container]?.name || esc(m.container)} × ${fmt(m.containers)}</td>
-        <td style="font-size:12.5px">${esc([m.location, m.manifest_no && 'ใบกำกับ ' + m.manifest_no, m.vehicle && 'รถ ' + m.vehicle, m.method && 'วิธี ' + m.method].filter(Boolean).join(' · ') || '—')}</td>
+        <td style="font-size:12.5px">${esc([m.location, m.manifest_no && 'ใบกำกับ ' + m.manifest_no, m.vehicle && 'รถ ' + m.vehicle, m.method && 'ระบบ ' + m.method].filter(Boolean).join(' · ') || '—')}</td>
         <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis">${esc(m.note || '')}</td>
-        <td class="by-cell">${m.actor ? `<i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ${esc(m.actor)}` : '—'}</td><td>${acts(m)}</td></tr>`; }).join('')}
+        <td class="by-cell">${m.actor ? `<i class="fa-solid fa-user-check" style="color:var(--ok)"></i> ${esc(m.actor)}` : '—'}</td>${can('admin') ? `<td>${acts(m)}</td>` : ''}</tr>`; }).join('')}
       </tbody></table></div>
-      <div class="hcards">${items.map(m => { const k = KIND[m.kind] || KIND.store; return `<div class="hcard"><div class="r1"><span class="tag k-${m.kind}"><i class="fa-solid ${k.icon}"></i>${k.short}</span><b>${esc(m.doc_no)}</b><span class="kg ${k.cls}">${k.sign}${fmtKg(m.weight_kg)} กก.</span></div>
+      <div class="hcards">${items.map(m => { const k = KIND[m.kind] || KIND.store; return `<div class="hcard"><div class="r1"><span class="tag k-${m.kind}"><i class="fa-solid ${k.icon}"></i>${k.short}</span><b>${esc(m.doc_no)}</b><span class="kg ${k.cls}">${k.sign}${fmtT(m.weight_kg)} ตัน</span></div>
         <p><span class="tcode" style="--c:${esc(m.color)}"><i class="fa-solid ${esc(m.icon)}"></i>${esc(m.code)}</span> ${esc(m.type_name)}</p>
         <small>${dtTH(m.moved_at)} · ${CONT[m.container]?.name || ''} × ${fmt(m.containers)} · ${esc(m.actor || '')}${m.manifest_no ? ' · ใบกำกับ ' + esc(m.manifest_no) : ''}${m.method ? ' · ' + esc(m.method) : ''}${m.note ? ' · ' + esc(m.note) : ''}</small>${acts(m)}</div>`; }).join('')}</div>`
       : '<div class="empty"><i class="fa-solid fa-magnifying-glass"></i>ไม่พบรายการตามเงื่อนไข</div>';
@@ -1015,8 +1020,8 @@ function historyPage(initial) {
   if (initial) { items = initial.items; show(); } else load();
 }
 
-/* ================= EDIT / DELETE (รหัสผ่านผู้ดูแล) =================
-   เซิร์ฟเวอร์ตรวจย้อนทุกรายการตามลำดับเวลา — ถ้ายอดใดจะติดลบจะปฏิเสธและแจ้งเหตุผล */
+/* ================= EDIT / DELETE (ผู้ดูแลระบบ) =================
+   เซิร์ฟเวอร์ตรวจสิทธิ์ (admin) และตรวจย้อนทุกรายการตามลำดับเวลา — ถ้ายอดใดจะติดลบจะปฏิเสธและแจ้งเหตุผล */
 function recordForm(html, onSave) {
   const m = modal(html + `<div id="eErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px;white-space:pre-line"></div>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-primary" id="eSave"><i class="fa-solid fa-floppy-disk"></i>บันทึก</button></div>`, true);
@@ -1036,40 +1041,45 @@ function recordForm(html, onSave) {
   };
   return m;
 }
-async function editMovement(m) {
-  try { await askPassword(); } catch (e) { toast(e.message, 'err'); return; }
+function editMovement(m) {
   const k = KIND[m.kind] || KIND.store, ship = m.kind === 'ship', treat = m.kind === 'treat';
+  const w0 = tonsStr(m.weight_kg); // exact (older kg rows may need up to 5 decimals)
   recordForm(`<h3><i class="fa-solid fa-pen-to-square" style="color:var(--brand)"></i> แก้ไขรายการ ${esc(m.doc_no)}</h3>
     <p><span class="tag k-${m.kind}"><i class="fa-solid ${k.icon}"></i>${k.name}</span></p>
     <p class="hint" style="margin-top:6px"><i class="fa-solid fa-circle-info"></i> เปลี่ยนชนิดรายการไม่ได้ — หากต้องการให้ลบแล้วบันทึกใหม่ · ระบบตรวจยอดคงเหลือย้อนหลังทุกรายการ ไม่ให้ติดลบ</p>
     <p class="hint"><i class="fa-solid fa-user-check" style="color:var(--ok)"></i> บันทึกโดย: <b>${esc(m.actor || 'ไม่ระบุ')}</b> · การแก้ไขนี้จะบันทึกใน Log ในนาม <b>${esc(meLabel())}</b></p>
     <div class="fields mt">
       <div class="field full"><label>ประเภทของเสีย</label><select id="eType">${typeOptions(m.type_id, t => ship || treat || +t.active === 1)}</select></div>
-      <div class="field"><label>น้ำหนัก (กก.)</label><input id="eW" inputmode="decimal" value="${+m.weight_kg}"></div>
+      <div class="field"><label>น้ำหนัก (ตัน)</label><input id="eW" inputmode="decimal" value="${w0}"></div>
       <div class="field"><label>ภาชนะ</label><select id="eC">${CONT_KEYS.map(c => `<option value="${c}" ${c === m.container ? 'selected' : ''}>${CONT[c].name}</option>`).join('')}</select></div>
       <div class="field"><label>จำนวนภาชนะ</label><input id="eN" inputmode="numeric" value="${+m.containers}"></div>
       <div class="field"><label>วันที่</label><input type="date" id="eDate" value="${m.moved_at.slice(0, 10)}"></div>
       <div class="field"><label>เวลา</label><input type="time" id="eTime" value="${m.moved_at.slice(11, 16)}"></div>
       ${ship ? `<div class="field"><label>เลขที่ใบกำกับการขนส่ง</label><input id="eMan" maxlength="60" value="${esc(m.manifest_no)}"></div><div class="field full"><label>ทะเบียนรถ</label><input id="eVeh" maxlength="40" value="${esc(m.vehicle)}"></div>`
-        : treat ? `<div class="field full"><label>วิธีบำบัด / ระบบ</label><input id="eMeth" maxlength="120" list="methList" value="${esc(m.method)}"><datalist id="methList">${TREAT_METHODS.map(x => `<option value="${esc(x)}">`).join('')}</datalist></div>`
+        : treat ? `<div class="field full"><label>ระบบ / วิธีการ</label><input id="eMeth" maxlength="120" list="methList" value="${esc(m.method)}"><datalist id="methList">${TREAT_METHODS.map(x => `<option value="${esc(x)}">`).join('')}</datalist></div>`
         : `<div class="field full"><label>สถานที่จัดเก็บ</label><input id="eLoc" maxlength="100" value="${esc(m.location)}"></div>`}
       <div class="field full"><label>หมายเหตุ</label><input id="eNote" maxlength="255" value="${esc(m.note)}"></div>
     </div>`, f => {
-    const body = { id: m.id, doc_no: m.doc_no, type_id: $('#eType', f).value, weight_kg: $('#eW', f).value, container: $('#eC', f).value, containers: $('#eN', f).value, date: $('#eDate', f).value, time: $('#eTime', f).value, note: $('#eNote', f).value };
+    const body = { id: m.id, doc_no: m.doc_no, type_id: $('#eType', f).value, container: $('#eC', f).value, containers: $('#eN', f).value, date: $('#eDate', f).value, time: $('#eTime', f).value, note: $('#eNote', f).value };
     if (ship) Object.assign(body, { manifest_no: $('#eMan', f).value, vehicle: $('#eVeh', f).value });
     else if (treat) body.method = $('#eMeth', f).value;
     else body.location = $('#eLoc', f).value;
-    return recordApi('movement_update', body);
+    // the weight only when it was changed: an untouched field keeps the stored kg exactly
+    const wt = $('#eW', f).value.trim();
+    if (wt !== w0) {
+      if (isNaN(parseT(wt))) return Promise.reject(new Error('น้ำหนักต้องเป็นตัวเลข (ตัน) เช่น 0.125'));
+      body.weight_t = wt;
+    }
+    return writeApi('movement_update', body);
   });
 }
 async function deleteMovement(m) {
   const k = KIND[m.kind]?.name || m.kind;
-  const msg = [`ลบรายการ ${m.doc_no}?`, '', `${k} ${m.code} ${m.type_name} ${fmtKg(m.weight_kg)} กก. · ${CONT[m.container]?.name || ''} × ${m.containers} · ${dtTH(m.moved_at)}`, '',
+  const msg = [`ลบรายการ ${m.doc_no}?`, '', `${k} ${m.code} ${m.type_name} ${fmtT(m.weight_kg)} ตัน · ${CONT[m.container]?.name || ''} × ${m.containers} · ${dtTH(m.moved_at)}`, '',
     'ยอดคงเหลือจะคำนวณใหม่ (ระบบไม่ยอมให้ยอดย้อนหลังติดลบ) · การลบย้อนกลับไม่ได้ ต้องการลบหรือไม่?'];
   try {
-    await askPassword();
     if (!confirm(msg.join('\n'))) return;
-    const r = await recordApi('movement_delete', { id: m.id, doc_no: m.doc_no });
+    const r = await writeApi('movement_delete', { id: m.id, doc_no: m.doc_no });
     toast(r.message, 'info');
     route();
   } catch (e) { toast(e.message, 'err'); }
@@ -1077,7 +1087,7 @@ async function deleteMovement(m) {
 
 /* ================= LOGS ================= */
 const LOGCAT = { waste: ['ของเสีย', 'fa-recycle', '#059669'], edit: ['แก้ไข / ลบ', 'fa-pen-to-square', '#8B5CF6'], setting: ['ตั้งค่า', 'fa-gear', '#0F2A23'], warn: ['ถูกปฏิเสธ', 'fa-ban', '#F59E0B'] };
-const LOGACT = { store: 'fa-box-archive', ship: 'fa-truck-arrow-right', opening: 'fa-flag-checkered', treat: 'fa-flask-vial', treat_unlock: 'fa-lock-open', movement_update: 'fa-pen-to-square', movement_delete: 'fa-trash-can', type_save: 'fa-gear', reset_data: 'fa-broom' };
+const LOGACT = { store: 'fa-box-archive', ship: 'fa-truck-arrow-right', opening: 'fa-flag-checkered', treat: 'fa-flask-vial', treat_unlock: 'fa-lock-open' /* older rows */, movement_update: 'fa-pen-to-square', movement_delete: 'fa-trash-can', type_save: 'fa-gear', reset_data: 'fa-broom' };
 async function logs() {
   const n = nowParts();
   let cat = '', items = null, loadedWith = '';
@@ -1119,7 +1129,7 @@ async function logs() {
     $('#lRes').innerHTML = loader();
     try {
       const q = params(false);
-      ({ items } = await logsApi('logs', q));
+      ({ items } = await readApi('logs', q));
       loadedWith = q;
       show();
     } catch (e) {
@@ -1160,7 +1170,7 @@ function typeForm(t) {
       <div class="field full"><label>ไอคอน</label><div class="icon-pick">${ICONS.map(i => `<button type="button" data-ic="${i}" class="${i === ic ? 'sel' : ''}"><i class="fa-solid ${i}"></i></button>`).join('')}</div></div>
       <div class="field full"><label>สี</label><div class="color-pick">${COLORS.map(c => `<button type="button" data-col="${c}" style="--c:${c}" class="${c.toUpperCase() === col.toUpperCase() ? 'sel' : ''}"></button>`).join('')}</div></div>
       <div class="field full"><label class="switch"><input type="checkbox" id="tAct" ${!t || +t.active === 1 ? 'checked' : ''}> ใช้งาน (แสดงในหน้าบันทึกจัดเก็บ)</label></div>
-    </div>`, f => recordApi('type_save', { id: t?.id || '', code: $('#tCode', f).value, mgmt_code: $('#tMg', f).value, name: $('#tName', f).value, permit_tons: $('#tTons', f).value, receiver_reg: $('#tReg', f).value, receiver: $('#tRecv', f).value, icon: ic, color: col, active: $('#tAct', f).checked ? 1 : 0 }));
+    </div>`, f => writeApi('type_save', { id: t?.id || '', code: $('#tCode', f).value, mgmt_code: $('#tMg', f).value, name: $('#tName', f).value, permit_tons: $('#tTons', f).value, receiver_reg: $('#tReg', f).value, receiver: $('#tRecv', f).value, icon: ic, color: col, active: $('#tAct', f).checked ? 1 : 0 }));
   m.addEventListener('click', e => {
     const i = e.target.closest('[data-ic]'), c = e.target.closest('[data-col]');
     if (i) { ic = i.dataset.ic; $$('[data-ic]', m).forEach(x => x.classList.toggle('sel', x === i)); }
@@ -1179,7 +1189,7 @@ const RESET_CONFIRM = [
 ].join('\n');
 function resetData() {
   const m = modal(`<h3><i class="fa-solid fa-trash-can" style="color:var(--bad)"></i> รีเซ็ตข้อมูล / Reset data</h3>
-    <p class="hint">ใส่รหัสผ่านผู้ดูแล (ตั้งโดยผู้ดูแลระบบใน Script Properties)</p>
+    <p class="hint">การรีเซ็ตลบข้อมูลทั้งหมดและย้อนกลับไม่ได้ — ใส่รหัสผ่านผู้ดูแลระบบอีกครั้งเพื่อยืนยัน</p>
     <div class="field mt"><label>รหัสผ่านผู้ดูแล</label><input type="password" id="rPw" autocomplete="off"></div>
     <div id="rErr" style="color:var(--bad);min-height:20px;margin-top:8px;font-size:13px"></div>
     <div class="modal-acts"><button class="btn btn-ghost" data-close>ยกเลิก</button><button class="btn btn-bad" id="rGo"><i class="fa-solid fa-trash-can"></i>รีเซ็ตข้อมูล</button></div>`);
@@ -1193,7 +1203,7 @@ function resetData() {
     go.disabled = true; go.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังรีเซ็ต...'; err.textContent = '';
     try {
       const reads = routeReads();
-      const r = await gasPost({ action: 'reset_data', resetPassword: pw, ...readsField(reads) });
+      const r = await gasPost({ action: 'reset_data', resetPassword: pw, client: CLIENT_ID, ...readsField(reads) });
       afterWrite(r, reads);
       pw = ''; inp.value = '';
       closeModal();
@@ -1210,4 +1220,4 @@ function resetData() {
   inp.focus();
 }
 
-route();
+if (S.sess) { $('#login').hidden = true; route(); } else showLogin();

@@ -124,6 +124,7 @@ function createGas() {
       getScriptProperties() {
         return {
           getProperty: k => (k in state.props ? state.props[k] : null),
+          getProperties: () => Object.assign({}, state.props),
           setProperty: (k, v) => { state.props[k] = String(v); },
           setProperties: (o) => { Object.assign(state.props, o); },
           deleteProperty: k => { delete state.props[k]; }
@@ -137,9 +138,9 @@ function createGas() {
           put: (k, v, ttl) => { state.cache[k] = String(v); state.cachePuts.push(ttl); },
           remove: k => { delete state.cache[k]; },
           // Batch calls (read cache / data versions); tracked apart from put().
-          getAll: keys => { if (state.cacheDown) throw new Error("Cache down"); state.cacheGetAlls++; const o = {}; keys.forEach(k => { if (k in state.cache) o[k] = state.cache[k]; }); return o; },
+          getAll: keys => { if (state.cacheDown || state.batchCacheDown) throw new Error("Cache down"); state.cacheGetAlls++; const o = {}; keys.forEach(k => { if (k in state.cache) o[k] = state.cache[k]; }); return o; },
           putAll: (map, ttl) => {
-            if (state.cacheDown) throw new Error("Cache down");
+            if (state.cacheDown || state.batchCacheDown) throw new Error("Cache down");
             Object.keys(map).forEach(k => {
               if (/^WASTE_V_/.test(k)) state.events.push("version:" + k.slice(8));
               const v = String(map[k]);
@@ -235,25 +236,41 @@ function test(name, fn) {
 
 const { gas, state } = createGas();
 const ctx = loadCode(gas);
-const RPW = "test-Reset-9"; // WASTE_RESET_PASSWORD of the in-memory mock (tests only)
+// Fake passwords of the in-memory mock (tests only; the real ones live in Script Properties).
+const VPW = "view-pass", SPW = "staff-pass", RPW = "admin-pass";
+const PROPS = { WASTE_VIEW_PASSWORD: VPW, WASTE_STAFF_PASSWORD: SPW, WASTE_RESET_PASSWORD: RPW };
 const ACTOR = "Tester";
-const LOG_ACTIONS = ["logs", "logs_export"];
-const get = (action, params = {}) => {
-  const out = ctx.doGet({ parameter: Object.assign({ action }, params) });
+const READS = ["bootstrap", "dashboard", "history", "export", "batch"];
+const STAFF_WRITES = ["store", "ship", "opening"];
+const ADMIN_ONLY = ["treat", "movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export"];
+const ALL_ACTIONS = READS.concat(STAFF_WRITES, ADMIN_ONLY);
+const getRaw = (params = {}) => {
+  const out = ctx.doGet({ parameter: params });
   assert.strictEqual(out.getMimeType(), "application/json");
   return JSON.parse(out.getContent());
 };
-const postRaw = (payload, who = ACTOR) =>
-  JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(Object.assign(who ? { actor: who } : {}, payload)) } }).getContent());
-const PW_ACTIONS = ["movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export"];
-const post = (action, body = {}, who = ACTOR) => postRaw(Object.assign(PW_ACTIONS.includes(action) ? { resetPassword: RPW } : {}, body, { action }), who);
+const rawPost = payload => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(payload) } }).getContent());
+const postRaw = (payload, who = ACTOR) => rawPost(Object.assign(who ? { actor: who } : {}, payload));
+const loginRes = (password, client) => rawPost({ action: "login", password, client });
+const login = (password, client) => okData(loginRes(password, client)).token;
+// session tokens of the three levels (set after login)
+let TV = "", TS = "", TA = "";
+const tokFor = a => STAFF_WRITES.includes(a) ? TS : READS.includes(a) ? TV : TA;
+const post = (action, body = {}, who = ACTOR) => postRaw(Object.assign({ token: tokFor(action) }, action === "reset_data" ? { resetPassword: RPW } : {}, body, { action }), who);
+// a read as the viewer (all reads are POST with a session token)
+const get = (action, params = {}) => postRaw(Object.assign({ action, token: TV }, params), null);
 const okData = res => { assert.strictEqual(res.ok, true, "expected ok, got: " + JSON.stringify(res)); return res.data; };
 const err = (res, re) => {
   assert.strictEqual(res.ok, false, "expected error, got: " + JSON.stringify(res).slice(0, 300));
   if (re) assert.ok(re.test(res.error), "error '" + res.error + "' !~ " + re);
   return res;
 };
-const clearFails = () => Object.keys(state.cache).forEach(k => { if (/FAILURES/.test(k)) delete state.cache[k]; });
+const clearFails = () => Object.keys(state.cache).forEach(k => { if (/FAILURES|^WASTE_LF_/.test(k)) delete state.cache[k]; });
+// kg -> exact tons text (what the page sends as weight_t), e.g. 1234.5 -> "1.2345"
+const T = kg => {
+  const c = Math.round(Number(String(kg).replace(/,/g, "")) * 100);
+  return String(Math.floor(c / 100000)) + "." + String(c % 100000).padStart(5, "0");
+};
 const p2 = n => String(n).padStart(2, "0");
 const bkkNow = () => new Date(Date.now() + 7 * 3600 * 1000);
 const fmtD = d => `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
@@ -267,14 +284,26 @@ const boot = () => okData(get("bootstrap"));
 const bal = id => boot().balance[id];
 const logs = (p = {}) => okData(post("logs", p)).items;
 const lastLog = () => logs()[0];
-const mv = (kind, type_id, weight_kg, extra = {}) => post(kind, Object.assign({ type_id, weight_kg, container: "drum200", containers: 1 }, at(5), extra));
+// a movement; the weight is given in kg here and sent as weight_t (tons) like the page does
+const mvT = (kind, type_id, weight_t, extra = {}) => post(kind, Object.assign({ type_id, weight_t, container: "drum200", containers: 1 }, at(5), extra));
+const mv = (kind, type_id, kg, extra = {}) => mvT(kind, type_id, T(kg), extra);
 
 console.log("Balance Waste GAS backend tests (today " + TODAY + " Asia/Bangkok)");
 
-/* ---------- setup ---------- */
-test("API before setup: reads and writes report the setupSystem error", () => {
+/* ---------- login / setup ---------- */
+test("login: no password property set -> nobody can log in (clear Thai message naming the 3 properties)", () => {
+  const r = err(loginRes("anything"), /ยังไม่ได้ตั้งรหัสผ่านใน Script Properties/);
+  assert.ok(/WASTE_RESET_PASSWORD, WASTE_STAFF_PASSWORD, WASTE_VIEW_PASSWORD/.test(r.error), r.error);
+  assert.strictEqual(r.passwordError, true);
+  err(get("bootstrap"), /เข้าสู่ระบบ/);
+});
+
+test("API before setup: reads and writes report the setupSystem error (after a valid login)", () => {
+  Object.assign(state.props, PROPS);
+  TV = login(VPW); TS = login(SPW); TA = login(RPW);
   err(get("bootstrap"), /setupSystem/);
   err(mv("store", 1, 10), /setupSystem/);
+  delete state.props.WASTE_VIEW_PASSWORD; delete state.props.WASTE_STAFF_PASSWORD; delete state.props.WASTE_RESET_PASSWORD;
 });
 
 test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permitted waste types", () => {
@@ -282,6 +311,8 @@ test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permit
   assert.strictEqual(r.created, true);
   assert.strictEqual(r.seededTypes, 13);
   assert.strictEqual(r.resetPasswordConfigured, false);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(r.passwords)), { WASTE_RESET_PASSWORD: false, WASTE_STAFF_PASSWORD: false, WASTE_VIEW_PASSWORD: false });
+  assert.ok(/ยังไม่ได้ตั้ง Script Property: WASTE_RESET_PASSWORD \(ผู้ดูแลระบบ\), WASTE_STAFF_PASSWORD \(พนักงานกรอกข้อมูล\), WASTE_VIEW_PASSWORD \(เข้าดูได้อย่างเดียว\).*เข้าสู่ระบบไม่ได้/.test(r.passwordMessage), r.passwordMessage);
   const ss = state.spreadsheets[state.props.WASTE_SPREADSHEET_ID];
   assert.strictEqual(ss.tz, "Asia/Bangkok");
   assert.strictEqual(ss.name, "Balance Waste Database");
@@ -290,7 +321,8 @@ test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permit
   assert.deepStrictEqual(sheet("movements").data[0], ["id", "doc_no", "kind", "type_id", "weight_kg", "container", "containers", "location", "manifest_no", "vehicle", "note", "moved_at", "created_at", "actor", "updated_at", "updated_by", "method"]);
   assert.strictEqual(dataRows("waste_types"), 13);
   assert.strictEqual(dataRows("movements"), 0);
-  state.props.WASTE_RESET_PASSWORD = RPW;
+  Object.assign(state.props, PROPS);
+  TV = login(VPW); TS = login(SPW); TA = login(RPW);
 });
 
 test("seeded types match the สก.2 2569 permit table (codes keep leading zeros, total 194 t)", () => {
@@ -328,22 +360,30 @@ test("setupSystem is idempotent (no second spreadsheet, no duplicate seed)", () 
   assert.strictEqual(state.created, 1);
   assert.strictEqual(dataRows("waste_types"), 13);
   assert.strictEqual(r.resetPasswordConfigured, true);
+  assert.ok(Object.values(r.passwords).every(Boolean));
+  assert.strictEqual(r.passwordMessage, "ตั้งรหัสผ่านครบทั้ง 3 ระดับแล้ว");
+  // one level unset: only that level is named
+  delete state.props.WASTE_VIEW_PASSWORD;
+  assert.ok(/^ยังไม่ได้ตั้ง Script Property: WASTE_VIEW_PASSWORD \(เข้าดูได้อย่างเดียว\) — /.test(ctx.setupSystem().passwordMessage));
+  state.props.WASTE_VIEW_PASSWORD = VPW;
 });
 
 /* ---------- transport ---------- */
-test("GET: service info, unknown action, writes and logs refused over GET", () => {
-  assert.strictEqual(okData(get("")).service, "Balance Waste API");
-  err(get("nope"), /Unknown action/);
-  for (const a of ["store", "ship", "opening", "treat", "treat_unlock", "treat_lock", "movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export", "verifyResetPassword"]) err(get(a), /POST/);
+test("GET: service info only; every action (reads too) refused over GET, so a token never sits in a URL", () => {
+  assert.strictEqual(okData(getRaw({})).service, "Balance Waste API");
+  err(getRaw({ action: "nope" }), /Unknown action/);
+  for (const a of ALL_ACTIONS.concat(["login", "logout"])) err(getRaw({ action: a, token: TA }), /POST/);
+  for (const a of ["treat_unlock", "treat_lock", "verifyResetPassword"]) err(getRaw({ action: a }), /Unknown action/); // removed
   const bad = JSON.parse(ctx.doPost({ postData: { contents: "{oops" } }).getContent());
   err(bad, /JSON/);
-  err(postRaw({ action: "nope" }), /Unknown action/);
+  err(postRaw({ action: "nope", token: TA }), /Unknown action/);
+  for (const a of ["treat_unlock", "treat_lock", "verifyResetPassword"]) err(postRaw({ action: a, token: TA, resetPassword: RPW }), /Unknown action/);
 });
 
 test("actor name required for every write (empty / whitespace / object rejected, nothing written)", () => {
   for (const who of [null, "", "   ", { x: 1 }]) {
     for (const a of ["store", "ship", "opening", "treat", "movement_update", "movement_delete", "type_save", "reset_data"]) {
-      const r = postRaw(Object.assign({ action: a, type_id: 1, weight_kg: 5, container: "drum200", containers: 1, resetPassword: RPW }, who && typeof who === "object" ? { actor: who } : {}), typeof who === "string" ? who : null);
+      const r = postRaw(Object.assign({ action: a, token: TA, type_id: 1, weight_t: "0.005", container: "drum200", containers: 1, resetPassword: RPW }, who && typeof who === "object" ? { actor: who } : {}), typeof who === "string" ? who : null);
       err(r, /ระบุชื่อผู้ใช้งาน/);
       assert.strictEqual(r.code, "NAME_REQUIRED");
     }
@@ -356,16 +396,20 @@ test("actor name required for every write (empty / whitespace / object rejected,
 test("store: field validation (type, weight, decimals, container, count, date, text length)", () => {
   err(mv("store", 0, 10), /เลือกประเภทของเสีย/);
   err(mv("store", 99, 10), /เลือกประเภทของเสีย/);
-  err(mv("store", 1, 0), /มากกว่า 0/);
-  err(mv("store", 1, ""), /กรอกน้ำหนัก/);
-  err(mv("store", 1, null), /กรอกน้ำหนัก/);
-  err(mv("store", 1, -5), /ตัวเลข/);
-  err(mv("store", 1, "abc"), /ตัวเลข/);
-  err(mv("store", 1, "1e3"), /ตัวเลข/);
-  err(mv("store", 1, "10.123"), /ทศนิยมได้ไม่เกิน 2/);
-  err(mv("store", 1, 10.005), /ทศนิยมได้ไม่เกิน 2/);
-  err(mv("store", 1, [5]), /กรอกน้ำหนัก/);
-  err(mv("store", 1, "2000000"), /ไม่เกิน/);
+  err(mvT("store", 1, 0), /มากกว่า 0 ตัน/);
+  err(mvT("store", 1, "0.000"), /มากกว่า 0 ตัน/);
+  err(mvT("store", 1, ""), /กรอกน้ำหนัก \(ตัน\)/);
+  err(mvT("store", 1, null), /กรอกน้ำหนัก/);
+  err(mvT("store", 1, undefined), /กรอกน้ำหนัก/);
+  err(mvT("store", 1, -5), /ตัวเลข/);
+  err(mvT("store", 1, "abc"), /ตัวเลข/);
+  err(mvT("store", 1, "1e3"), /ตัวเลข/);
+  err(mvT("store", 1, "0.000001"), /ทศนิยมได้ไม่เกิน 5/); // finer than 0.01 kg
+  err(mvT("store", 1, 0.0000015), /ทศนิยมได้ไม่เกิน 5|ตัวเลข/);
+  err(mvT("store", 1, [5]), /กรอกน้ำหนัก/);
+  err(mvT("store", 1, "1000.001"), /ไม่เกิน 1,000\.000 ตัน/);
+  // the old kg field is not a weight any more (the page sends tons)
+  err(post("store", Object.assign({ type_id: 1, weight_kg: 5, container: "drum200", containers: 1 }, at(5))), /กรอกน้ำหนัก/);
   err(mv("store", 1, 10, { container: "box" }), /ภาชนะ/);
   err(mv("store", 1, 10, { container: "" }), /ภาชนะ/);
   err(mv("store", 1, 10, { containers: 0 }), /จำนวนเต็มตั้งแต่ 1/);
@@ -384,12 +428,12 @@ test("store: field validation (type, weight, decimals, container, count, date, t
   assert.ok(w.length >= 10 && w.every(l => /^ปฏิเสธ/.test(l.detail) && l.actor === ACTOR));
 });
 
-test("store: saved with doc number, actor, 2-decimal weight; comma input accepted; audit row", () => {
-  const r = okData(mv("store", 1, "1,234.5", { container: "bigbag", containers: 3, location: "โรงเก็บ A", note: "ทดสอบ" }));
+test("store: saved with doc number, actor, weight in tons stored as kg; comma input accepted; audit row", () => {
+  const r = okData(mvT("store", 1, "1.2345", { container: "bigbag", containers: 3, location: "โรงเก็บ A", note: "ทดสอบ" }));
   assert.strictEqual(r.doc_no, "ST-" + YMD + "-0001");
   assert.strictEqual(r.kind, "store");
   assert.strictEqual(r.balance_kg, 1234.5);
-  assert.ok(/บันทึกจัดเก็บ/.test(r.message));
+  assert.ok(/บันทึกจัดเก็บ .* 1\.2345 ตัน เรียบร้อย/.test(r.message), r.message);
   const row = sheet("movements").data[1];
   assert.strictEqual(row[1], r.doc_no);
   assert.strictEqual(row[2], "store");
@@ -401,8 +445,8 @@ test("store: saved with doc number, actor, 2-decimal weight; comma input accepte
   const l = lastLog();
   assert.strictEqual(l.category, "waste");
   assert.strictEqual(l.ref, r.doc_no);
-  assert.ok(l.detail.includes("1,234.5 กก.") && l.detail.includes("Bigbag 3 ภาชนะ"));
-  const r2 = okData(mv("store", 1, 0.1, { container: "bigbag", containers: 1 }));
+  assert.ok(l.detail.includes("1.2345 ตัน") && l.detail.includes("Bigbag 3 ภาชนะ"), l.detail);
+  const r2 = okData(mvT("store", 1, "0.0001", { container: "bigbag", containers: 1 })); // 0.1 kg
   assert.strictEqual(r2.doc_no, "ST-" + YMD + "-0002");
 });
 
@@ -420,16 +464,94 @@ test("balance math is exact to 0.01 kg (no float drift) and counts containers pe
   assert.strictEqual(bal(1).containers.bigbag, 4);
 });
 
+/* ---------- units: tons on the page, kg in the sheet ---------- */
+function freshEnv() {
+  const g = createGas();
+  const c = loadCode(g.gas);
+  c.setupSystem();
+  Object.assign(g.state.props, PROPS);
+  const raw = body => JSON.parse(c.doPost({ postData: { contents: JSON.stringify(Object.assign({ actor: ACTOR }, body)) } }).getContent());
+  const tok = okData(raw({ action: "login", password: RPW })).token;
+  const ss = g.state.spreadsheets[g.state.props.WASTE_SPREADSHEET_ID];
+  return { c, ss, call: b => raw(Object.assign({ token: tok }, b)) };
+}
+
+test("units: weight_t (tons) -> kg in the sheet exactly (0.001 t = 1 kg, finest 0.01 kg); no float drift", () => {
+  const E = freshEnv();
+  const ms = E.ss.getSheetByName("movements");
+  const cases = [["0.125", 125], ["1", 1000], ["0.001", 1], ["12.345", 12345], [0.3, 300], ["0.1234", 123.4], ["0.00001", 0.01],
+    [2.675, 2675], ["1,000", 1000000], ["0.07", 70], [1.005, 1005], ["999.99999", 999999.99], [" 0.5 ", 500]];
+  for (const [t, kg] of cases) {
+    const r = okData(E.call({ action: "store", type_id: 1, weight_t: t, container: "bigbag", containers: 1, ...at(3) }));
+    const row = ms.data.find(x => x[1] === r.doc_no);
+    assert.strictEqual(row[4], kg, "weight_t " + JSON.stringify(t));
+    assert.strictEqual(typeof row[4], "number");
+  }
+  // 0.1 t + 0.2 t ... never drifts (sums in hundredths of a kg)
+  for (let i = 0; i < 10; i++) okData(E.call({ action: "store", type_id: 2, weight_t: i % 2 ? "0.2" : "0.1", container: "ibc", containers: 1, ...at(3) }));
+  const b = okData(E.call({ action: "bootstrap" })).balance[2];
+  assert.strictEqual(b.balance_kg, 1500);
+  // the text forms: thousands separators, 3 decimals, more only for a fraction of a kg
+  assert.strictEqual(E.c.fmtT_(1234567.89), "1,234.56789");
+  assert.strictEqual(E.c.fmtT_(125), "0.125");
+  assert.strictEqual(E.c.fmtT_(0), "0.000");
+  assert.strictEqual(E.c.fmtT_(1000000), "1,000.000");
+  assert.strictEqual(E.c.fmtT_(-5), "-0.005");
+  assert.strictEqual(E.c.fmtT_(0.01), "0.00001");
+  assert.strictEqual(E.c.tonsText_(1234567.8, false), "1234.5678");
+  assert.strictEqual(E.c.tonsToKg_("0.125"), 125);
+  for (const k of [0.01, 0.1, 1.23, 99.99, 1234.56, 50000.05]) {
+    assert.strictEqual(E.c.tonsToKg_(E.c.tonsText_(k, false)), k, "round trip " + k); // every stored kg can be typed back exactly
+  }
+});
+
+test("units: older kg rows (2 decimals) — shown exactly in tons, ship-all exact, edit without weight keeps the kg", () => {
+  const E = freshEnv();
+  const ms = E.ss.getSheetByName("movements");
+  const st = okData(E.call({ action: "store", type_id: 13, weight_t: "1.23456", container: "ibc", containers: 2, ...at(9) }));
+  // an older row typed in kg (as the previous version stored it)
+  const row = ms.data.find(x => x[1] === st.doc_no);
+  assert.strictEqual(row[4], 1234.56);
+  assert.ok(/1\.23456 ตัน เรียบร้อย/.test(st.message), st.message);
+  // edit the note only: the weight stays 1234.56 kg (the page sends weight_t only when it was changed)
+  okData(E.call({ action: "movement_update", id: st.id, doc_no: st.doc_no, note: "แก้หมายเหตุ" }));
+  assert.strictEqual(ms.data.find(x => x[1] === st.doc_no)[4], 1234.56);
+  // more than the balance by 0.01 kg is refused with tons in the message
+  const r = err(E.call({ action: "ship", type_id: 13, weight_t: "1.23457", container: "ibc", containers: 1, ...at(2) }), /มี 1\.23456 ตัน แต่ต้องนำออก 1\.23457 ตัน/);
+  assert.strictEqual(r.code, "NEGATIVE_BALANCE");
+  okData(E.call({ action: "ship", type_id: 13, weight_t: "1.23456", container: "ibc", containers: 2, ...at(2) }));
+  assert.strictEqual(okData(E.call({ action: "bootstrap" })).balance[13].balance_kg, 0);
+  const csv = okData(E.call({ action: "export", type: "13" })).csv;
+  assert.ok(csv.split("\n")[0].includes('"น้ำหนัก (ตัน)"'));
+  assert.ok(csv.includes(",1.23456,"), csv);
+  // quota: permit in tons, shipped in kg -> % unchanged (type 7: 0.5 t)
+  okData(E.call({ action: "store", type_id: 7, weight_t: "0.7", container: "drum200", containers: 1, ...at(3) }));
+  okData(E.call({ action: "ship", type_id: 7, weight_t: "0.399", container: "drum200", containers: 1, ...at(2) }));
+  let b = okData(E.call({ action: "bootstrap" })).balance[7];
+  assert.strictEqual(b.permit_kg, 500);
+  assert.strictEqual(b.quota_pct, 79.8);
+  assert.strictEqual(b.quota_level, "ok");
+  // the edit dialog sends tons too
+  const sh = okData(E.call({ action: "history", type: "7", kind: "ship" })).items[0];
+  okData(E.call({ action: "movement_update", id: sh.id, doc_no: sh.doc_no, weight_t: "0.4" }));
+  b = okData(E.call({ action: "bootstrap" })).balance[7];
+  assert.strictEqual(b.shipped_year_kg, 400);
+  assert.strictEqual(b.quota_pct, 80);
+  assert.strictEqual(b.quota_level, "warn");
+  const d = okData(E.call({ action: "dashboard" }));
+  assert.strictEqual(d.kpi.permit_kg, 194000);
+});
+
 /* ---------- ship ---------- */
 test("ship: cannot exceed the current balance or containers; exact remaining amount allowed", () => {
   okData(mv("store", 3, 100, { container: "bigbag", containers: 2, ...at(10) }));
   const before = dataRows("movements");
   const r = err(mv("ship", 3, "100.01", { container: "bigbag", containers: 1, ...at(2) }), /ส่งกำจัดเกินยอดคงเหลือ/);
   assert.strictEqual(r.code, "NEGATIVE_BALANCE");
-  assert.ok(/100 กก\. แต่ต้องนำออก 100\.01 กก\./.test(r.error), r.error);
+  assert.ok(/มี 0\.100 ตัน แต่ต้องนำออก 0\.10001 ตัน/.test(r.error), r.error);
   err(mv("ship", 3, 50, { container: "bigbag", containers: 3, ...at(2) }), /Bigbag.*มี 2 ภาชนะ แต่ต้องนำออก 3/);
   err(mv("ship", 3, 50, { container: "drum200", containers: 1, ...at(2) }), /ถัง 200 ลิตร/);
-  err(mv("ship", 4, 1, { ...at(2) }), /มี 0 กก\./);
+  err(mv("ship", 4, 1, { ...at(2) }), /มี 0\.000 ตัน/);
   assert.strictEqual(dataRows("movements"), before);
   const s = okData(mv("ship", 3, 100, { container: "bigbag", containers: 2, manifest_no: "MN-1", vehicle: "70-1234", ...at(2) }));
   assert.strictEqual(s.doc_no, "SH-" + YMD + "-0002"); // SH-0001 used by the balance-math test
@@ -557,64 +679,50 @@ test("CSV export: Thai headers, codes keep leading zeros, formula-like text neut
   const r = okData(get("export", { type: "5" }));
   assert.ok(/^waste_history_\d{8}_\d{6}\.csv$/.test(r.filename));
   const lines = r.csv.trim().split("\n");
-  assert.ok(lines[0].startsWith('เลขที่เอกสาร,วันที่,เวลา,รายการ,รหัสของเสีย,ชื่อของเสีย,รหัสการจัดการ,ผู้รับดำเนินการ,"น้ำหนัก (กก.)",ภาชนะ,จำนวนภาชนะ'), lines[0]);
+  assert.ok(lines[0].startsWith('เลขที่เอกสาร,วันที่,เวลา,รายการ,รหัสของเสีย,ชื่อของเสีย,รหัสการจัดการ,ผู้รับดำเนินการ,"น้ำหนัก (ตัน)",ภาชนะ,จำนวนภาชนะ'), lines[0]);
   assert.ok(lines[0].endsWith("ผู้บันทึก"));
   assert.ok(r.csv.includes('"=""080409"""'), "code as Excel text");
   assert.ok(r.csv.includes('"=""042"""'));
   assert.ok(r.csv.includes("'=HYPERLINK") && r.csv.includes("'+cmd"));
   assert.ok(!/,=HYPERLINK/.test(r.csv));
-  assert.ok(r.csv.includes(",1.00,"));
+  assert.ok(r.csv.includes(",0.001,")); // 1 kg in tons
   assert.strictEqual(lines.length - 1, okData(get("history", { type: "5" })).items.length);
   const row = sheet("movements").data.find(x => String(x[10]).includes("HYPERLINK"));
   assert.strictEqual(row[10], "=HYPERLINK(\"http://x\")"); // stored as text via apostrophe
 });
 
-/* ---------- in-house treatment (บำบัดเองภายใน) + hidden mode ---------- */
-const unlock = () => okData(postRaw({ action: "treat_unlock", resetPassword: RPW }, null)).token;
-// a read sent as POST with a treatment token (the page does this while unlocked)
-const tread = (tok, action, params = {}) => okData(postRaw(Object.assign({ action, treatToken: tok }, params), null));
-let TT = "";
+/* ---------- in-house data (ข้อมูลภายใน, kind "treat"): admin only ---------- */
+// a read with a given session token
+const tread = (tok, action, params = {}) => okData(postRaw(Object.assign({ action, token: tok }, params), null));
 let TR1 = null;
 
-test("treat: POST only; locked without a token; unlock needs the admin password (same lockout), audited", () => {
+test("treat: admin only (staff / viewer FORBIDDEN, nothing written); the old unlock flow is gone", () => {
   const before = dataRows("movements");
-  let r = err(mv("treat", 11, 5), /ล็อก/);
-  assert.strictEqual(r.code, "TREAT_LOCKED");
-  err(mv("treat", 11, 5, { treatToken: "x".repeat(64) }), /ล็อก/);
-  err(mv("treat", 11, 5, { treatToken: "a".repeat(64) }), /ล็อก/); // well-formed but never issued
-  clearFails();
-  r = err(postRaw({ action: "treat_unlock", resetPassword: "bad" }, null), /รหัสไม่ถูกต้อง/);
-  assert.strictEqual(r.passwordError, true);
-  assert.strictEqual(state.cache.WASTE_RESET_FAILURES, "1"); // same counter as every admin password check
-  err(postRaw({ action: "treat_unlock" }, null), /รหัสไม่ถูกต้อง/);
-  state.cache.WASTE_RESET_FAILURES = "10";
-  err(postRaw({ action: "treat_unlock", resetPassword: RPW }, null), /หลายครั้งเกินไป/);
-  clearFails();
-  const puts = state.cachePuts.length;
-  TT = unlock();
-  assert.ok(/^[0-9a-f]{64}$/.test(TT));
-  assert.ok(state.cachePuts.slice(puts).includes(21600), "token kept 6 h (CacheService maximum)");
-  assert.ok(Number(state.cache["WASTE_TT_" + TT]) > Date.now());
+  for (const tok of [TS, TV]) {
+    const r = err(mv("treat", 11, 5, { token: tok }), /ต้องเป็น “ผู้ดูแลระบบ”/);
+    assert.strictEqual(r.code, "FORBIDDEN");
+  }
+  err(mv("treat", 11, 5, { token: "a".repeat(64) }), /เข้าสู่ระบบ/);
   assert.strictEqual(dataRows("movements"), before);
-  assert.strictEqual(lastLog().action, "treat_unlock");
-  assert.ok(!JSON.stringify(sheet("audit_logs").data).includes(TT), "token never in the audit log");
+  assert.ok(boot().treat === false && tread(TS, "bootstrap").treat === false && tread(TA, "bootstrap").treat === true);
+  assert.strictEqual(tread(TA, "bootstrap", { hideTreat: true }).treat, false, "admin may hide it on screen");
 });
 
 test("treat: lowers the in-plant balance like a shipment but is never counted in the สก.2 quota", () => {
   okData(mv("store", 12, 300, { container: "drum200", containers: 3, ...at(6) }));
   okData(mv("ship", 12, 100, { container: "drum200", containers: 1, ...at(4) }));
-  const d0 = tread(TT, "dashboard");
-  const r = okData(mv("treat", 12, 150, { container: "drum200", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", note: "ทดสอบ", treatToken: TT, ...at(3) }));
+  const d0 = tread(TA, "dashboard");
+  const r = okData(mv("treat", 12, 150, { container: "drum200", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", note: "ทดสอบ", ...at(3) }));
   TR1 = r;
   assert.strictEqual(r.doc_no, "TR-" + YMD + "-0001");
   assert.strictEqual(r.kind, "treat");
   assert.strictEqual(r.balance_kg, 50);
-  assert.ok(/บำบัดเองภายใน/.test(r.message));
+  assert.ok(/^ข้อมูลภายใน .* 0\.150 ตัน เรียบร้อย/.test(r.message), r.message);
   const row = sheet("movements").data.find(x => x[1] === r.doc_no);
   assert.strictEqual(row[2], "treat");
   assert.strictEqual(row[16], "ระบบบำบัดน้ำเสียภายในโรงงาน"); // method: appended column
   assert.strictEqual(row[8], ""); // no manifest / vehicle for a treatment
-  // hidden (anonymous) view: true balance, quota counts the shipment only, no treatment totals
+  // viewer / staff view: true balance, quota counts the shipment only, no treatment totals
   const b = bal(12);
   assert.strictEqual(b.balance_kg, 50);
   assert.strictEqual(b.containers.drum200, 1);
@@ -624,15 +732,15 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   assert.strictEqual(b.quota_pct, 20);
   assert.ok(!("treated_kg" in b) && !("treated_year_kg" in b));
   assert.strictEqual(boot().treat, false);
-  // unlocked view: the treatment totals add up
-  const bt = tread(TT, "bootstrap");
+  // admin view: the in-house totals add up
+  const bt = tread(TA, "bootstrap");
   assert.strictEqual(bt.treat, true);
   const u = bt.balance[12];
   assert.strictEqual(u.treated_kg, 150);
   assert.strictEqual(u.treated_year_kg, 150);
   assert.strictEqual(u.quota_pct, 20);
   assert.strictEqual(Math.round((u.in_kg - u.shipped_kg - u.treated_kg) * 100) / 100, u.balance_kg);
-  const d = tread(TT, "dashboard");
+  const d = tread(TA, "dashboard");
   assert.strictEqual(d.kpi.year_out_kg, d0.kpi.year_out_kg, "quota use unchanged by a treatment");
   assert.strictEqual(d.kpi.quota_pct, d0.kpi.quota_pct);
   assert.deepStrictEqual(d.receivers.map(x => x.shipped_year_kg), d0.receivers.map(x => x.shipped_year_kg));
@@ -645,102 +753,88 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   const l = logs()[0];
   assert.strictEqual(l.action, "treat");
   assert.strictEqual(l.ref, r.doc_no);
-  assert.ok(l.detail.includes("บำบัดเองภายใน") && l.detail.includes("วิธีบำบัด: ระบบบำบัดน้ำเสียภายในโรงงาน") && l.actor === ACTOR);
+  assert.ok(l.detail.startsWith("ข้อมูลภายใน ") && l.detail.includes("0.150 ตัน") && l.detail.includes("ระบบ / วิธีการ: ระบบบำบัดน้ำเสียภายในโรงงาน") && l.actor === ACTOR, l.detail);
 });
 
 test("treat: cannot exceed the balance or containers (chronological replay); hidden error never names the treatment row", () => {
   const before = dataRows("movements");
-  let r = err(mv("treat", 12, "50.01", { treatToken: TT, ...at(2) }), /บำบัดเกินยอดคงเหลือ/);
+  let r = err(mv("treat", 12, "50.01", { ...at(2) }), /ข้อมูลภายในเกินยอดคงเหลือ/);
   assert.strictEqual(r.code, "NEGATIVE_BALANCE");
-  err(mv("treat", 12, 10, { containers: 2, treatToken: TT, ...at(2) }), /ถัง 200 ลิตร.*มี 1 ภาชนะ แต่ต้องนำออก 2/);
-  err(mv("treat", 12, 10, { container: "ibc", treatToken: TT, ...at(2) }), /IBC/);
-  err(mv("treat", 4, 1, { treatToken: TT, ...at(2) }), /มี 0 กก\./);
-  err(mv("treat", 12, 10, { treatToken: TT, ...at(7) }), /บำบัดเกินยอดคงเหลือ/); // before the stock existed
-  err(mv("treat", 12, 10, { method: "x".repeat(121), treatToken: TT, ...at(2) }), /วิธีบำบัด \/ ระบบยาวเกิน 120/);
+  err(mv("treat", 12, 10, { containers: 2, ...at(2) }), /ถัง 200 ลิตร.*มี 1 ภาชนะ แต่ต้องนำออก 2/);
+  err(mv("treat", 12, 10, { container: "ibc", ...at(2) }), /IBC/);
+  err(mv("treat", 4, 1, { ...at(2) }), /มี 0\.000 ตัน/);
+  err(mv("treat", 12, 10, { ...at(7) }), /ข้อมูลภายในเกินยอดคงเหลือ/); // before the stock existed
+  err(mv("treat", 12, 10, { method: "x".repeat(121), ...at(2) }), /ระบบ \/ วิธีการยาวเกิน 120/);
   // a back-dated shipment that would make the later treatment negative
-  r = err(mv("ship", 12, 60, { ...at(5) }), /ติดลบในรายการภายหลัง/);
-  assert.ok(!/TR-|บำบัด/.test(r.error), r.error);
-  r = err(mv("ship", 12, 60, { treatToken: TT, ...at(5) }), /ติดลบที่รายการ TR-.*บำบัดเองภายใน/);
+  r = err(mv("ship", 12, 60, { ...at(5) }), /ติดลบในรายการภายหลัง/); // staff: the in-house row is not named
+  assert.ok(!/TR-|ภายใน\)/.test(r.error), r.error);
+  r = err(mv("ship", 12, 60, { token: TA, ...at(5) }), /ติดลบที่รายการ TR-.*\(ข้อมูลภายใน\)/);
+  r = err(mv("ship", 12, 60, { token: TA, hideTreat: 1, ...at(5) }), /ติดลบในรายการภายหลัง/); // admin hiding it
   assert.strictEqual(dataRows("movements"), before);
-  okData(mv("treat", 12, "0.5", { treatToken: TT, ...at(2) }));
+  okData(mv("treat", 12, "0.5", { ...at(2) }));
   assert.strictEqual(bal(12).balance_kg, 49.5);
 });
 
-test("hidden mode: history / CSV / dashboard / batch leave out treatment rows; token reads (POST) include them", () => {
-  const all = okData(get("history")).items;
-  assert.ok(all.length > 0 && all.every(m => m.kind !== "treat"));
-  assert.strictEqual(all.length, dataRows("movements") - 2);
-  assert.strictEqual(okData(get("history", { kind: "treat" })).items.length, 0);
-  assert.strictEqual(okData(get("history", { q: "บำบัดน้ำเสีย" })).items.length, 0);
-  assert.strictEqual(okData(get("history", { q: "TR-" })).items.length, 0);
-  // a token in a GET query is ignored (tokens travel in POST bodies only)
-  assert.ok(okData(get("history", { treatToken: TT })).items.every(m => m.kind !== "treat"));
-  assert.strictEqual(okData(get("bootstrap", { treatToken: TT })).treat, false);
-  const dh = okData(get("dashboard"));
-  assert.ok(!/treat|TR-/.test(JSON.stringify(dh)), "no treatment data in the hidden dashboard");
-  assert.ok(dh.recent.every(m => m.kind !== "treat"));
-  assert.ok(!/treated|TR-/.test(JSON.stringify(boot())));
-  // unlocked
-  const th = tread(TT, "history", { kind: "treat" }).items;
+test("in-house data only for admin: history / CSV / dashboard / batch leave it out for viewer + staff (and admin hiding it)", () => {
+  for (const tok of [TV, TS]) {
+    const all = tread(tok, "history").items;
+    assert.ok(all.length > 0 && all.every(m => m.kind !== "treat"));
+    assert.strictEqual(all.length, dataRows("movements") - 2);
+    assert.strictEqual(tread(tok, "history", { kind: "treat" }).items.length, 0);
+    assert.strictEqual(tread(tok, "history", { q: "บำบัดน้ำเสีย" }).items.length, 0);
+    assert.strictEqual(tread(tok, "history", { q: "TR-" }).items.length, 0);
+    const dh = tread(tok, "dashboard");
+    assert.ok(!/treat|TR-/.test(JSON.stringify(dh)), "no in-house data in the dashboard");
+    assert.ok(!/treated|TR-/.test(JSON.stringify(tread(tok, "bootstrap"))));
+    const bh = tread(tok, "batch", { reads: [{ action: "history", kind: "treat" }] });
+    assert.strictEqual(bh.results[0].items.length, 0);
+    const c0 = tread(tok, "export", { type: "12" }).csv;
+    assert.ok(!/TR-|ภายในโรงงาน|ระบบ \/ วิธีการ/.test(c0), "CSV without in-house rows / column");
+  }
+  // a client flag never widens access: viewer / staff asking hideTreat: false still get nothing
+  assert.strictEqual(tread(TS, "bootstrap", { hideTreat: false, treat: true }).treat, false);
+  // admin hiding it on screen: same as staff
+  const hid = tread(TA, "history", { hideTreat: true });
+  assert.ok(hid.items.every(m => m.kind !== "treat"));
+  assert.ok(!/treated/.test(JSON.stringify(tread(TA, "bootstrap", { hideTreat: 1 }))));
+  // admin
+  const th = tread(TA, "history", { kind: "treat" }).items;
   assert.strictEqual(th.length, 2);
   assert.strictEqual(th[1].method, "ระบบบำบัดน้ำเสียภายในโรงงาน");
-  assert.strictEqual(tread(TT, "history").items.length, dataRows("movements"));
-  assert.strictEqual(tread(TT, "history", { q: "บำบัดน้ำเสีย" }).items.length, 1);
-  assert.ok(tread(TT, "dashboard").recent.some(m => m.kind === "treat"));
-  const bt = tread(TT, "batch", { reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] });
+  assert.strictEqual(tread(TA, "history").items.length, dataRows("movements"));
+  assert.strictEqual(tread(TA, "history", { q: "บำบัดน้ำเสีย" }).items.length, 1);
+  assert.ok(tread(TA, "dashboard").recent.some(m => m.kind === "treat"));
+  const bt = tread(TA, "batch", { reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] });
   assert.strictEqual(bt.results[0].treat, true);
   assert.strictEqual(bt.results[1].items.length, 2);
-  const bh = okData(get("batch", { reads: JSON.stringify([{ action: "history", kind: "treat" }]) }));
-  assert.strictEqual(bh.results[0].items.length, 0);
-  // CSV
-  const c0 = okData(get("export", { type: "12" })).csv;
-  assert.ok(!/TR-|บำบัด|วิธีบำบัด/.test(c0), "hidden CSV has no treatment rows / column");
-  const c1 = tread(TT, "export", { type: "12" }).csv;
+  // CSV (tons)
+  const c1 = tread(TA, "export", { type: "12" }).csv;
   const lines = c1.trim().split("\n");
-  assert.ok(lines[0].endsWith(",ผู้บันทึก,\"วิธีบำบัด / ระบบ\""), lines[0]);
+  assert.ok(lines[0].includes(",\"น้ำหนัก (ตัน)\",") && lines[0].endsWith(",ผู้บันทึก,\"ระบบ / วิธีการ\""), lines[0]);
   const tr = lines.find(x => x.startsWith(TR1.doc_no));
-  assert.ok(tr && tr.includes(",บำบัดเองภายใน,") && tr.includes(",บำบัดเองภายในโรงงาน,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
-  assert.strictEqual(lines.length - 1, tread(TT, "history", { type: "12" }).items.length);
-  // a write carrying reads answers in the mode of its token
+  assert.ok(tr && tr.includes(",ข้อมูลภายใน,") && tr.includes(",ภายในโรงงาน,0.150,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
+  assert.strictEqual(lines.length - 1, tread(TA, "history", { type: "12" }).items.length);
+  // a write carrying reads answers in the mode of its session
   const w0 = okData(mv("store", 12, 1, { ...at(1), reads: [{ action: "bootstrap" }] }));
   assert.strictEqual(w0.reads[0].treat, false);
+  assert.strictEqual(w0.reads[0].role, "staff");
   assert.ok(!("treated_kg" in w0.reads[0].balance[12]));
-  const w1 = okData(mv("store", 12, 1, { ...at(1), treatToken: TT, reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
+  const w1 = okData(mv("store", 12, 1, { ...at(1), token: TA, reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
   assert.strictEqual(w1.reads[0].treat, true);
+  assert.strictEqual(w1.reads[0].role, "admin");
   assert.strictEqual(w1.reads[0].balance[12].treated_kg, 150.5);
   assert.strictEqual(w1.reads[1].items.length, 2);
-  // dashboard "logs today" count leaves out treatment audit rows when hidden
-  assert.ok(okData(get("dashboard")).logsToday < tread(TT, "dashboard").logsToday);
+  // dashboard "logs today" count leaves out in-house audit rows for non-admin
+  assert.ok(okData(get("dashboard")).logsToday < tread(TA, "dashboard").logsToday);
 });
 
-test("treat token: lock drops it; an expired / evicted token is refused for reads and writes", () => {
-  const t2 = unlock();
-  assert.strictEqual(tread(t2, "bootstrap").treat, true);
-  assert.strictEqual(okData(postRaw({ action: "treat_lock", treatToken: t2 }, null)).locked, true);
-  assert.ok(!("WASTE_TT_" + t2 in state.cache));
-  assert.strictEqual(tread(t2, "bootstrap").treat, false);
-  assert.strictEqual(tread(t2, "history", { kind: "treat" }).items.length, 0);
-  err(mv("treat", 12, 1, { treatToken: t2, ...at(1) }), /ล็อก/);
-  okData(postRaw({ action: "treat_lock", treatToken: "nope" }, null)); // harmless
-  const t3 = unlock();
-  state.cache["WASTE_TT_" + t3] = String(Date.now() - 1); // expired
-  assert.strictEqual(tread(t3, "bootstrap").treat, false);
-  err(mv("treat", 12, 1, { treatToken: t3, ...at(1) }), /ล็อก/);
-  delete state.cache["WASTE_TT_" + t3]; // evicted
-  assert.strictEqual(tread(t3, "dashboard").kpi.treated_kg, undefined);
-  state.cacheDown = true; // cache outage: locked, reads still answer
-  try { assert.strictEqual(tread(TT, "bootstrap").treat, false); } finally { state.cacheDown = false; }
-  assert.strictEqual(tread(TT, "bootstrap").treat, true); // the first token still works
-});
-
-test("treat rows: edit / delete with the admin password like any row (replay checked, audited)", () => {
+test("treat rows: edit / delete by admin like any row (replay checked, audited); staff cannot", () => {
   const id = TR1.id;
-  err(postRaw({ action: "movement_update", id, weight_kg: 100 }), /รหัสไม่ถูกต้อง/);
-  clearFails();
+  assert.strictEqual(err(post("movement_update", { id, weight_t: "0.1", token: TS }), /ผู้ดูแลระบบ/).code, "FORBIDDEN");
   // stock of type 12: 300 + 1 + 1 in, 100 shipped, 150 + 0.5 treated -> 51.5 left
-  err(post("movement_update", { id, doc_no: TR1.doc_no, weight_kg: "201.51" }), /แก้ไขไม่ได้/);
+  err(post("movement_update", { id, doc_no: TR1.doc_no, weight_t: "0.20151" }), /แก้ไขไม่ได้/);
   err(post("movement_update", { id, kind: "ship" }), /เปลี่ยนชนิดรายการไม่ได้/);
-  const ok = okData(post("movement_update", { id, doc_no: TR1.doc_no, weight_kg: 120, method: "เตาเผาภายในโรงงาน" }));
+  const ok = okData(post("movement_update", { id, doc_no: TR1.doc_no, weight_t: "0.120", method: "เตาเผาภายในโรงงาน" }));
   assert.strictEqual(ok.changed, true);
   assert.strictEqual(bal(12).balance_kg, 81.5);
   assert.strictEqual(bal(12).quota_pct, 20);
@@ -749,12 +843,12 @@ test("treat rows: edit / delete with the admin password like any row (replay che
   assert.strictEqual(row[16], "เตาเผาภายในโรงงาน");
   const l = lastLog();
   assert.strictEqual(l.action, "movement_update");
-  assert.ok(l.detail.includes("ระบบบำบัดน้ำเสียภายในโรงงาน") && l.detail.includes("เตาเผาภายในโรงงาน"));
-  // a store the treatment depends on cannot be deleted; the treatment itself can
+  assert.ok(l.detail.includes("ระบบบำบัดน้ำเสียภายในโรงงาน") && l.detail.includes("เตาเผาภายในโรงงาน") && l.detail.includes("0.120 ตัน"));
+  // a store the in-house row depends on cannot be deleted; the in-house row itself can
   const b6 = bal(6).balance_kg;
   const st = okData(mv("store", 6, 40, { container: "ibc", containers: 1, ...at(9) }));
-  const tr = okData(mv("treat", 6, 40, { container: "ibc", containers: 1, treatToken: TT, ...at(8) }));
-  err(post("movement_delete", { id: st.id, doc_no: st.doc_no }), /ลบไม่ได้.*ติดลบในรายการภายหลัง/);
+  const tr = okData(mv("treat", 6, 40, { container: "ibc", containers: 1, ...at(8) }));
+  err(post("movement_delete", { id: st.id, doc_no: st.doc_no, hideTreat: true }), /ลบไม่ได้.*ติดลบในรายการภายหลัง/);
   okData(post("movement_delete", { id: tr.id, doc_no: tr.doc_no }));
   assert.strictEqual(lastLog().action, "movement_delete");
   okData(post("movement_delete", { id: st.id, doc_no: st.doc_no }));
@@ -765,80 +859,234 @@ test("migration: an older movements sheet without the method column keeps workin
   const g = createGas();
   const c2 = loadCode(g.gas);
   c2.setupSystem();
-  g.state.props.WASTE_RESET_PASSWORD = RPW;
+  Object.assign(g.state.props, PROPS);
   const ss = g.state.spreadsheets[g.state.props.WASTE_SPREADSHEET_ID];
   const ms = ss.getSheetByName("movements");
   const p = body => JSON.parse(c2.doPost({ postData: { contents: JSON.stringify(Object.assign({ actor: ACTOR }, body)) } }).getContent());
-  okData(p({ action: "store", type_id: 13, weight_kg: 500, container: "ibc", containers: 1, ...at(3) }));
+  const tok = okData(p({ action: "login", password: RPW })).token;
+  okData(p({ action: "store", token: tok, type_id: 13, weight_t: "0.5", container: "ibc", containers: 1, ...at(3) }));
   // simulate the sheet as created by the previous version: no "method" column
   ms.data.forEach(row => { row.length = 16; });
   assert.ok(!ms.data[0].includes("method"));
   c2.clearReadCache();
-  const g0 = JSON.parse(c2.doGet({ parameter: { action: "bootstrap" } }).getContent());
-  assert.strictEqual(okData(g0).balance[13].balance_kg, 500);
+  assert.strictEqual(okData(p({ action: "bootstrap", token: tok })).balance[13].balance_kg, 500);
   assert.strictEqual(ms.data[0][16], "method", "column appended to the header");
-  const tok = okData(p({ action: "treat_unlock", resetPassword: RPW })).token;
-  const r = okData(p({ action: "treat", type_id: 13, weight_kg: 200, container: "ibc", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", treatToken: tok, ...at(2) }));
+  const r = okData(p({ action: "treat", token: tok, type_id: 13, weight_t: "0.2", container: "ibc", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", ...at(2) }));
   assert.strictEqual(r.balance_kg, 300);
   const row = ms.data.find(x => x[1] === r.doc_no);
   assert.strictEqual(row[16], "ระบบบำบัดน้ำเสียภายในโรงงาน");
   assert.strictEqual(ms.data[1][16] || "", ""); // the old row reads the new column as empty
 });
 
-/* ---------- password gating ---------- */
-test("reset password: missing property, wrong password, logs need POST + password", () => {
-  const saved = state.props.WASTE_RESET_PASSWORD;
-  delete state.props.WASTE_RESET_PASSWORD;
-  const r = err(post("movement_delete", { id: 1 }), /WASTE_RESET_PASSWORD/);
-  assert.strictEqual(r.passwordError, true);
-  state.props.WASTE_RESET_PASSWORD = saved;
-  err(postRaw({ action: "movement_delete", id: 1 }), /รหัสไม่ถูกต้อง/);
-  err(postRaw({ action: "type_save", resetPassword: "nope" }), /รหัสไม่ถูกต้อง/);
-  err(postRaw({ action: "logs" }, null), /รหัสไม่ถูกต้อง/);
-  err(postRaw({ action: "logs_export", resetPassword: "x" }, null), /รหัสไม่ถูกต้อง/);
-  assert.strictEqual(okData(postRaw({ action: "verifyResetPassword", resetPassword: RPW }, null)).valid, true);
-  err(postRaw({ action: "verifyResetPassword", resetPassword: "bad" }, null), /รหัสไม่ถูกต้อง/);
-  assert.ok(state.sleeps >= 5000);
+/* ---------- login, sessions, roles ---------- */
+test("login: each password gives its level; token 64 hex in CacheService (12 h session, 6 h cache entry); no secrets stored", () => {
   clearFails();
+  const puts = state.cachePuts.length;
+  const now = Date.now();
+  for (const [pw, role, name] of [[VPW, "viewer", "เข้าดูได้อย่างเดียว"], [SPW, "staff", "พนักงานกรอกข้อมูล"], [RPW, "admin", "ผู้ดูแลระบบ"]]) {
+    const d = okData(loginRes(pw));
+    assert.ok(/^[0-9a-f]{64}$/.test(d.token));
+    assert.strictEqual(d.role, role);
+    assert.strictEqual(d.role_name, name);
+    assert.strictEqual(d.ttl, 43200);
+    assert.ok(Math.abs(d.expires_at - (now + 43200e3)) < 5000);
+    const rec = JSON.parse(state.cache["WASTE_SS_" + d.token]);
+    assert.strictEqual(rec.r, role);
+    assert.ok(!JSON.stringify(rec).includes(pw), "password not in the session entry");
+    assert.strictEqual(tread(d.token, "bootstrap").role, role);
+    assert.strictEqual(tread(d.token, "bootstrap").role_name, name);
+  }
+  assert.ok(state.cachePuts.slice(puts).every(t => t === 21600), "session entries kept 6 h (CacheService maximum)");
+  // wrong / odd passwords
+  for (const bad of ["", "nope", " " + VPW, VPW.toUpperCase(), null, 123, { p: VPW }, [SPW]]) {
+    const r = err(loginRes(bad), /รหัสไม่ถูกต้อง/);
+    assert.strictEqual(r.passwordError, true);
+  }
+  clearFails();
+  // the same password set for two levels: the higher level wins
+  state.props.WASTE_STAFF_PASSWORD = VPW;
+  assert.strictEqual(okData(loginRes(VPW)).role, "staff");
+  state.props.WASTE_STAFF_PASSWORD = SPW;
 });
 
-test("reset password lockout: 10 wrong attempts lock even the right password (15 min, cache counter)", () => {
+test("roles: every action x every level (server-side; viewer reads only, staff + store/opening/ship, admin all)", () => {
+  const rows0 = dataRows("movements"), logs0 = dataRows("audit_logs");
+  const expect = { viewer: READS, staff: READS.concat(STAFF_WRITES), admin: ALL_ACTIONS };
+  for (const [role, tok] of [["viewer", TV], ["staff", TS], ["admin", TA]]) {
+    for (const a of ALL_ACTIONS) {
+      // writes without a name stop right after the role check (nothing written)
+      const r = postRaw({ action: a, token: tok, reads: a === "batch" ? [{ action: "bootstrap" }] : undefined }, null);
+      if (!expect[role].includes(a)) {
+        assert.strictEqual(r.ok, false, role + " " + a);
+        assert.strictEqual(r.code, "FORBIDDEN", role + " " + a + ": " + r.error);
+        assert.ok(/ต้องเป็น “(พนักงานกรอกข้อมูล|ผู้ดูแลระบบ)”/.test(r.error), r.error);
+      } else if (READS.includes(a) || a === "logs" || a === "logs_export") {
+        assert.strictEqual(r.ok, true, role + " " + a + ": " + r.error);
+      } else {
+        assert.strictEqual(r.code, "NAME_REQUIRED", role + " " + a + ": " + r.error);
+      }
+    }
+  }
+  // the minimum level of each action, as the server enforces it
+  const minRole = a => READS.includes(a) ? "viewer" : STAFF_WRITES.includes(a) ? "staff" : "admin";
+  assert.deepStrictEqual(Object.keys(ctx.ACTION_ROLE).sort(), ALL_ACTIONS.slice().sort());
+  ALL_ACTIONS.forEach(a => assert.strictEqual(ctx.ACTION_ROLE[a], minRole(a), a));
+  // a staff write really works; a viewer one is refused before anything is written
+  okData(mv("store", 1, 1, { container: "bigbag", containers: 1, ...at(1) }));
+  err(mv("store", 1, 1, { token: TV, container: "bigbag", containers: 1, ...at(1) }), /ต้องเป็น “พนักงานกรอกข้อมูล”/);
+  err(post("type_save", { token: TS, code: "123456", name: "x", permit_tons: 1, mgmt_code: "011", receiver: "r" }), /ผู้ดูแลระบบ/);
+  err(post("reset_data", { token: TS }), /ผู้ดูแลระบบ/);
+  assert.strictEqual(dataRows("movements"), rows0 + 1);
+  assert.strictEqual(dataRows("audit_logs"), logs0 + 1, "refused requests are not audited (no lock taken)");
+});
+
+test("sessions: no / bad / unknown / expired token -> AUTH_REQUIRED on every action; logout ends a session", () => {
+  const before = dataRows("movements");
+  for (const tok of [undefined, "", "x", "a".repeat(64), "A".repeat(64), { t: TA }, TA + "0"]) {
+    for (const a of ALL_ACTIONS) {
+      const r = postRaw({ action: a, token: tok, type_id: 1, weight_t: "1", container: "drum200", containers: 1, resetPassword: RPW });
+      assert.strictEqual(r.code, "AUTH_REQUIRED", a + " " + JSON.stringify(tok) + ": " + JSON.stringify(r));
+      assert.ok(/กรุณาเข้าสู่ระบบ/.test(r.error));
+    }
+  }
+  assert.strictEqual(dataRows("movements"), before);
+  // expired (absolute 12 h)
+  const t = login(SPW);
+  const rec = JSON.parse(state.cache["WASTE_SS_" + t]);
+  rec.e = Date.now() - 1;
+  state.cache["WASTE_SS_" + t] = JSON.stringify(rec);
+  for (const a of ["bootstrap", "store"]) assert.strictEqual(postRaw({ action: a, token: t }).code, "AUTH_REQUIRED");
+  // evicted / corrupt entry
+  const t2 = login(VPW);
+  state.cache["WASTE_SS_" + t2] = "{bad json";
+  assert.strictEqual(postRaw({ action: "bootstrap", token: t2 }).code, "AUTH_REQUIRED");
+  state.cache["WASTE_SS_" + t2] = JSON.stringify({ r: "root", e: Date.now() + 1e6, p: Date.now(), f: "x" });
+  assert.strictEqual(postRaw({ action: "bootstrap", token: t2 }).code, "AUTH_REQUIRED");
+  // logout
+  const t3 = login(RPW);
+  assert.strictEqual(tread(t3, "bootstrap").role, "admin");
+  assert.strictEqual(okData(rawPost({ action: "logout", token: t3 })).loggedOut, true);
+  assert.ok(!("WASTE_SS_" + t3 in state.cache));
+  assert.strictEqual(postRaw({ action: "logs", token: t3 }).code, "AUTH_REQUIRED");
+  okData(rawPost({ action: "logout", token: "nope" })); // harmless
+  okData(rawPost({ action: "logout" }));
+  // cache outage: sessions cannot be checked -> refused (never "logged in by default")
+  state.cacheDown = true;
+  try {
+    assert.strictEqual(postRaw({ action: "bootstrap", token: TA }).code, "AUTH_REQUIRED");
+    err(loginRes(VPW));
+  } finally { state.cacheDown = false; }
+  assert.strictEqual(tread(TA, "bootstrap").role, "admin"); // fine again afterwards
+});
+
+test("sessions: the cache entry is renewed while in use (12 h > 6 h cache limit), never past the 12 h end", () => {
+  const t = login(VPW);
+  const key = "WASTE_SS_" + t;
+  let rec = JSON.parse(state.cache[key]);
+  const p0 = rec.p;
+  const puts = state.cachePuts.length;
+  tread(t, "bootstrap");
+  assert.strictEqual(JSON.parse(state.cache[key]).p, p0, "no renewal within the first hour");
+  assert.strictEqual(state.cachePuts.length, puts);
+  rec.p = Date.now() - 2 * 3600e3;
+  rec.e = Date.now() + 3 * 3600e3; // 3 h left
+  state.cache[key] = JSON.stringify(rec);
+  tread(t, "dashboard");
+  rec = JSON.parse(state.cache[key]);
+  assert.ok(Date.now() - rec.p < 5000, "renewed");
+  const ttl = state.cachePuts[state.cachePuts.length - 1];
+  assert.ok(ttl > 10700 && ttl <= 10800, "renewed only up to the session end: " + ttl);
+  assert.ok(rec.e < Date.now() + 3 * 3600e3 + 1000, "absolute end unchanged");
+});
+
+test("sessions: changing or removing a password ends the sessions of that level only; unset level cannot log in", () => {
+  const tv = login(VPW), ts = login(SPW);
+  state.props.WASTE_STAFF_PASSWORD = "staff-pass-2";
+  assert.strictEqual(postRaw({ action: "bootstrap", token: ts }).code, "AUTH_REQUIRED");
+  assert.strictEqual(tread(tv, "bootstrap").role, "viewer");
+  err(loginRes(SPW), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(okData(loginRes("staff-pass-2")).role, "staff");
+  state.props.WASTE_STAFF_PASSWORD = SPW;
   clearFails();
-  for (let i = 0; i < 10; i++) err(postRaw({ action: "verifyResetPassword", resetPassword: "wrong" + i }, null), /รหัสไม่ถูกต้อง/);
-  const r = err(postRaw({ action: "verifyResetPassword", resetPassword: RPW }, null), /หลายครั้งเกินไป/);
+  delete state.props.WASTE_VIEW_PASSWORD;
+  assert.strictEqual(postRaw({ action: "bootstrap", token: tv }).code, "AUTH_REQUIRED");
+  err(loginRes(VPW), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(okData(loginRes(SPW)).role, "staff"); // other levels still work
+  state.props.WASTE_VIEW_PASSWORD = VPW;
+  clearFails();
+  assert.strictEqual(tread(TV, "bootstrap").role, "viewer");
+});
+
+test("login lockout: 5 wrong per browser (client id) and 30 wrong overall per 15 min lock even the right password; open sessions keep working", () => {
+  clearFails();
+  const A = "0123456789abcdef", B = "fedcba9876543210";
+  const s0 = state.sleeps;
+  for (let i = 0; i < 5; i++) err(loginRes("wrong" + i, A), /รหัสไม่ถูกต้อง/);
+  assert.ok(state.sleeps - s0 >= 5000, "1 s per wrong attempt");
+  let r = err(loginRes(RPW, A), /หลายครั้งเกินไป/);
   assert.strictEqual(r.passwordError, true);
-  err(post("movement_delete", { id: 1 }), /หลายครั้งเกินไป/);
-  err(post("logs"), /หลายครั้งเกินไป/);
-  assert.strictEqual(state.cache.WASTE_RESET_FAILURES, "10");
+  assert.strictEqual(state.cache["WASTE_LF_" + A], "5");
   assert.ok(state.cachePuts.includes(900));
+  assert.strictEqual(okData(loginRes(VPW, B)).role, "viewer", "another browser is not locked");
+  // a right password clears that browser's counter
+  for (let i = 0; i < 3; i++) err(loginRes("wrong" + i, B), /รหัสไม่ถูกต้อง/);
+  okData(loginRes(VPW, B));
+  assert.ok(!("WASTE_LF_" + B in state.cache));
+  // a client id that is not hex is ignored (global counter only)
+  err(loginRes("wrong", "../evil"), /รหัสไม่ถูกต้อง/);
+  assert.ok(!Object.keys(state.cache).some(k => k.includes("evil")));
   clearFails();
-  assert.strictEqual(okData(postRaw({ action: "verifyResetPassword", resetPassword: RPW }, null)).valid, true);
+  for (let i = 0; i < 30; i++) err(loginRes("wrong" + i), /รหัสไม่ถูกต้อง/);
+  r = err(loginRes(VPW, B), /หลายครั้งเกินไป/);
+  err(loginRes(RPW), /หลายครั้งเกินไป/);
+  assert.strictEqual(state.cache.WASTE_LOGIN_FAILURES, "30");
+  assert.strictEqual(tread(TA, "bootstrap").role, "admin", "existing sessions are not affected");
+  // reset_data shares the lockout
+  err(post("reset_data", {}), /หลายครั้งเกินไป/);
+  clearFails();
+  assert.strictEqual(okData(loginRes(VPW)).role, "viewer");
+});
+
+test("reset_data: admin session + the admin password typed again (missing property, wrong password, lockout counter)", () => {
+  const saved = state.props.WASTE_RESET_PASSWORD;
+  delete state.props.WASTE_RESET_PASSWORD;
+  err(post("reset_data", {}), /เข้าสู่ระบบ/); // the admin session ends with the password
+  state.props.WASTE_RESET_PASSWORD = saved;
+  clearFails();
+  err(post("reset_data", { resetPassword: "bad", client: "00112233445566aa" }), /รหัสไม่ถูกต้อง/);
+  err(post("reset_data", { resetPassword: undefined }), /รหัสไม่ถูกต้อง/);
+  assert.strictEqual(state.cache.WASTE_LOGIN_FAILURES, "2");
+  assert.strictEqual(state.cache.WASTE_LF_00112233445566aa, "1");
+  assert.ok(dataRows("movements") > 0, "nothing wiped");
+  clearFails();
 });
 
 test("password never echoed in responses, logs or audit rows; no secrets in the source", () => {
-  const all = JSON.stringify(state.logs) + JSON.stringify(sheet("audit_logs").data);
-  assert.ok(!all.includes(RPW));
+  const all = JSON.stringify(state.logs) + JSON.stringify(sheet("audit_logs").data) + JSON.stringify(state.cache);
+  for (const pw of [VPW, SPW, RPW]) assert.ok(!all.includes(pw), pw);
+  assert.ok(!JSON.stringify(sheet("audit_logs").data).includes(TA), "tokens never in the audit log");
   const src = fs.readFileSync(path.join(ROOT, "apps-script", "Code.gs"), "utf8");
-  assert.ok(!/RESET_PASSWORD\s*=\s*["'][^"']+["']\s*;?\s*$/m.test(src.replace(/RESET_PASSWORD_PROPERTY = "WASTE_RESET_PASSWORD"/, "")));
-  assert.ok(!src.includes("dev-reset") && !src.includes(RPW));
+  assert.ok(!/_PASSWORD\s*=\s*["'][^"']+["']\s*;?\s*$/m.test(src.replace(/(RESET_PASSWORD_PROPERTY|[A-Z_]*PASSWORD[A-Z_]*) = "WASTE_[A-Z]+_PASSWORD"/g, "")));
+  for (const s of ["dev-reset", "dev-staff", "dev-view", VPW, SPW, RPW]) assert.ok(!src.includes(s), s);
   assert.ok(!/AKfycb|https:\/\/hooks\./.test(src));
+  for (const prop of ["WASTE_VIEW_PASSWORD", "WASTE_STAFF_PASSWORD", "WASTE_RESET_PASSWORD"]) assert.ok(src.includes('"' + prop + '"'), prop);
 });
 
 /* ---------- edit / delete integrity ---------- */
 test("movement_update: edits with replay check; lowering a store that a later ship needs is refused", () => {
   const st = okData(mv("store", 9, 100, { container: "bigbag", containers: 2, ...at(8) }));
   const sh = okData(mv("ship", 9, 80, { container: "bigbag", containers: 1, ...at(4) }));
-  let r = err(post("movement_update", { id: st.id, doc_no: st.doc_no, weight_kg: 79.99 }), /แก้ไขไม่ได้.*ติดลบที่รายการ SH-/);
+  let r = err(post("movement_update", { id: st.id, doc_no: st.doc_no, weight_t: "0.07999" }), /แก้ไขไม่ได้.*ติดลบที่รายการ SH-/);
   assert.strictEqual(r.code, "NEGATIVE_BALANCE");
   err(post("movement_update", { id: st.id, doc_no: st.doc_no, containers: 0 }), /จำนวนเต็มตั้งแต่ 1/);
   err(post("movement_update", { id: sh.id, doc_no: sh.doc_no, containers: 3 }), /แก้ไขไม่ได้/);
   err(post("movement_update", { id: st.id, ...at(3) }), /แก้ไขไม่ได้/); // moving the store after the ship
   err(post("movement_update", { id: st.id, type_id: 10 }), /แก้ไขไม่ได้/); // the ship of type 9 loses its stock
-  err(post("movement_update", { id: st.id, doc_no: "ST-000000-9999", weight_kg: 120 }), /ไม่ตรงกัน/);
-  err(post("movement_update", { id: 99999, weight_kg: 1 }), /ไม่พบรายการ/);
+  err(post("movement_update", { id: st.id, doc_no: "ST-000000-9999", weight_t: "0.12" }), /ไม่ตรงกัน/);
+  err(post("movement_update", { id: 99999, weight_t: "0.001" }), /ไม่พบรายการ/);
   err(post("movement_update", { id: st.id, kind: "ship" }), /เปลี่ยนชนิดรายการไม่ได้/);
   assert.strictEqual(okData(post("movement_update", { id: st.id, doc_no: st.doc_no })).changed, false);
-  const ok = okData(post("movement_update", { id: st.id, doc_no: st.doc_no, weight_kg: "120.5", note: "แก้แล้ว", location: "B" }));
+  const ok = okData(post("movement_update", { id: st.id, doc_no: st.doc_no, weight_t: "0.1205", note: "แก้แล้ว", location: "B" }));
   assert.strictEqual(ok.changed, true);
   assert.strictEqual(bal(9).balance_kg, 40.5);
   const row = sheet("movements").data.find(x => x[1] === st.doc_no);
@@ -848,10 +1096,10 @@ test("movement_update: edits with replay check; lowering a store that a later sh
   assert.ok(row[14]);
   const l = lastLog();
   assert.strictEqual(l.category, "edit");
-  assert.ok(l.detail.includes("เดิม:") && l.detail.includes("100 กก.") && l.detail.includes("120.5 กก."));
+  assert.ok(l.detail.includes("เดิม:") && l.detail.includes("0.100 ตัน") && l.detail.includes("0.1205 ตัน"), l.detail);
   // a ship edited above the stock is refused, within it accepted
-  err(post("movement_update", { id: sh.id, weight_kg: 120.51 }), /แก้ไขไม่ได้/);
-  okData(post("movement_update", { id: sh.id, weight_kg: 120.5, manifest_no: "MN-77" }));
+  err(post("movement_update", { id: sh.id, weight_t: "0.12051" }), /แก้ไขไม่ได้/);
+  okData(post("movement_update", { id: sh.id, weight_t: 0.1205, manifest_no: "MN-77" }));
   assert.strictEqual(bal(9).balance_kg, 0);
 });
 
@@ -918,6 +1166,7 @@ test("read cache: repeated reads served from CacheService; every write bumps the
   assert.strictEqual(state.sheetReads.movements || 0, n0, "cached reads must not read the sheet");
   const v0 = state.cache.WASTE_V_movements;
   assert.ok(v0);
+  const b1 = bal(1).balance_kg;
   const ev0 = state.events.length;
   okData(mv("store", 1, 2, { container: "bigbag", containers: 1, ...at(1) }));
   const v1 = state.cache.WASTE_V_movements;
@@ -925,7 +1174,7 @@ test("read cache: repeated reads served from CacheService; every write bumps the
   const evs = state.events.slice(ev0);
   assert.ok(evs.indexOf("flush") < evs.lastIndexOf("version:movements"), "flush before the version bump");
   const b = bal(1);
-  assert.strictEqual(b.balance_kg, Math.round((1234.6 + 2 - 1) * 100) / 100); // fresh data after the write
+  assert.strictEqual(b.balance_kg, Math.round((b1 + 2) * 100) / 100); // fresh data after the write
   // waste_types version unchanged by a movement write
   const vt = state.cache.WASTE_V_waste_types;
   okData(mv("store", 1, 1, { container: "bigbag", containers: 1, ...at(1) }));
@@ -936,7 +1185,7 @@ test("read cache: repeated reads served from CacheService; every write bumps the
   assert.strictEqual(state.cache.WASTE_V_movements, vm0);
 });
 
-test("read cache: clearReadCache() forces fresh reads (hand edits); cache outage still answers", () => {
+test("read cache: clearReadCache() forces fresh reads (hand edits); a read-cache outage still answers", () => {
   boot();
   const n0 = state.sheetReads.waste_types || 0;
   sheet("waste_types").data[1][2] = "กระดาษลัง (แก้ด้วยมือ)";
@@ -946,11 +1195,11 @@ test("read cache: clearReadCache() forces fresh reads (hand edits); cache outage
   assert.ok((state.sheetReads.waste_types || 0) > n0);
   sheet("waste_types").data[1][2] = "กระดาษลูกฟูก กระดาษลัง";
   ctx.clearReadCache();
-  state.cacheDown = true;
+  state.batchCacheDown = true; // the read cache / data versions fail; sessions (get) still answer
   try {
     assert.strictEqual(boot().types[0].name, "กระดาษลูกฟูก กระดาษลัง");
     okData(mv("store", 1, 1, { container: "bigbag", containers: 1, ...at(1) }));
-  } finally { state.cacheDown = false; }
+  } finally { state.batchCacheDown = false; }
   ctx.clearReadCache();
 });
 
@@ -1000,7 +1249,7 @@ test("keepWarm / installKeepWarmTrigger / removeKeepWarmTrigger", () => {
 });
 
 /* ---------- audit log ---------- */
-test("audit log: POST with password, filters by category / search / date, CSV", () => {
+test("audit log (admin session): filters by category / search / date, CSV; texts in tons", () => {
   const all = logs();
   assert.ok(all.length > 20);
   for (let i = 1; i < all.length; i++) assert.ok(all[i - 1].id > all[i].id);
@@ -1011,11 +1260,13 @@ test("audit log: POST with password, filters by category / search / date, CSV", 
   assert.ok(/^waste_log_\d{8}_\d{6}\.csv$/.test(c.filename));
   assert.ok(c.csv.startsWith("ลำดับ,วันที่,เวลา,หมวด,เลขที่อ้างอิง,รายละเอียด,ผู้ทำรายการ\n"));
   assert.ok(c.csv.includes("ตั้งค่า"));
+  assert.ok(logs({ cat: "waste" }).slice(0, 5).every(l => / ตัน · /.test(l.detail)));
 });
 
 /* ---------- reset data ---------- */
-test("reset_data: password + name required; wipes movements and logs, keeps waste types; numbers restart", () => {
-  err(postRaw({ action: "reset_data", resetPassword: "bad" }), /รหัสไม่ถูกต้อง/);
+test("reset_data: admin session + password + name required; wipes movements and logs, keeps waste types; numbers restart", () => {
+  assert.strictEqual(postRaw({ action: "reset_data", resetPassword: RPW }).code, "AUTH_REQUIRED");
+  err(post("reset_data", { resetPassword: "bad" }), /รหัสไม่ถูกต้อง/);
   clearFails();
   assert.ok(dataRows("movements") > 0);
   const r = okData(post("reset_data", { reads: [{ action: "bootstrap" }] }));
@@ -1042,12 +1293,12 @@ test("sheet storage: numbers / codes / dates keep their formats (no Date convers
 /* ---------- regressions (bug hunt 2026-10) ---------- */
 test("hidden mode: balance last_at never reveals the time of a treatment row", () => {
   const s = okData(mv("store", 2, 40, { container: "ibc", containers: 2, ...at(10) }));
-  okData(mv("treat", 2, 5, { container: "ibc", containers: 1, treatToken: TT, ...at(1) }));
+  okData(mv("treat", 2, 5, { container: "ibc", containers: 1, ...at(1) }));
   const atStore = okData(get("history", { type: "2" })).items.find(m => m.doc_no === s.doc_no).moved_at;
   const hidden = boot().balance[2];
   assert.strictEqual(hidden.last_at, atStore);
   assert.ok(!("last_vis_at" in hidden) && !("treated_kg" in hidden));
-  const shown = tread(TT, "bootstrap").balance[2];
+  const shown = tread(TA, "bootstrap").balance[2];
   assert.strictEqual(shown.last_at, at(1).date + " 09:00:00");
   assert.ok(!("last_vis_at" in shown));
   assert.strictEqual(hidden.balance_kg, shown.balance_kg); // the balance itself stays true
@@ -1056,7 +1307,7 @@ test("hidden mode: balance last_at never reveals the time of a treatment row", (
 
 test("movement_update: an empty date / time keeps the stored moment (not silently moved to now)", () => {
   const s = okData(mv("store", 2, 3, { container: "ibc", containers: 1, ...at(8, 7, 15) }));
-  const r = okData(post("movement_update", { id: s.id, doc_no: s.doc_no, weight_kg: "4", date: "", time: "" }));
+  const r = okData(post("movement_update", { id: s.id, doc_no: s.doc_no, weight_t: "0.004", date: "", time: "" }));
   assert.strictEqual(r.changed, true);
   const row = okData(get("history", { type: "2" })).items.find(m => m.id === s.id);
   assert.strictEqual(row.moved_at, at(8).date + " 07:15:00");
@@ -1085,7 +1336,7 @@ test("CSV: a note with backslash + quote stays in one Excel cell (RFC 4180 quote
 
 /* ---------- frontend ---------- */
 const readDoc = f => fs.readFileSync(path.join(ROOT, f), "utf8");
-test("docs JS files parse; config shape; GET with _=ts; POST text/plain; actor sent; UTF-8 BOM CSV", () => {
+test("docs JS files parse; config shape; POST text/plain only; token in the body; actor sent; UTF-8 BOM CSV", () => {
   for (const f of ["docs/config.js", "docs/assets/app.js", "test/dev-server.js"]) new Function(readDoc(f).replace(/^#!.*\n/, ""));
   const cfg = {};
   new Function("window", readDoc("docs/config.js"))(cfg);
@@ -1093,30 +1344,73 @@ test("docs JS files parse; config shape; GET with _=ts; POST text/plain; actor s
   assert.ok(cfg.WASTE_CONFIG.apiUrl === "" || /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(cfg.WASTE_CONFIG.apiUrl));
   const app = readDoc("docs/assets/app.js");
   assert.ok(app.includes("window.WASTE_CONFIG"));
-  assert.ok(app.includes("u.searchParams.set('_', Date.now())"));
   assert.ok(app.includes("'Content-Type': 'text/plain;charset=UTF-8'"));
+  assert.ok(!/method: 'GET'|searchParams\.set/.test(app), "no GET requests (a token never goes into a URL)");
   assert.ok(/actor: S\.user/.test(app) && app.includes("store('get', 'wasteUser')"));
   assert.ok(app.includes("'\\uFEFF' + r.csv"));
   for (const a of ["store", "ship", "opening", "movement_update", "movement_delete", "type_save", "reset_data"]) assert.ok(new RegExp("NAME_REQUIRED = \\[[^\\]]*'" + a + "'").test(app), a);
-  for (const a of ["'movement_update'", "'movement_delete'", "'type_save'", "'verifyResetPassword'", "'logs_export'", "'batch'", "action: 'reset_data', resetPassword"]) assert.ok(app.includes(a), a);
-  // the admin password is kept in memory only
+  for (const a of ["'movement_update'", "'movement_delete'", "'type_save'", "'logs'", "'logs_export'", "'batch'", "action: 'reset_data', resetPassword", "action: 'login', password", "action: 'logout', token"]) assert.ok(app.includes(a), a);
+  for (const gone of ["'treat_unlock'", "'treat_lock'", "verifyResetPassword", "askPassword", "recordPassword", "treatToken"]) assert.ok(!app.includes(gone), gone);
+  // session: token in sessionStorage + POST bodies only; passwords never stored
+  assert.ok(app.includes("if (S.sess) body.token = S.sess.t;") && app.includes("ss('set', SESS_KEY, JSON.stringify(S.sess))"));
+  assert.ok(!/localStorage\.setItem\([^)]*(SESS|sess|token)/i.test(app));
   assert.ok(!/(local|session)Storage\.setItem\([^)]*([Pp]ass|[Rr]eset)/.test(app));
-  assert.ok(!/store\('set', *'[^']*([Pp]ass|[Rr]eset)/.test(app));
+  assert.ok(!/(store|ss)\('set', *'[^']*([Pp]ass|[Rr]eset)/.test(app));
+  assert.ok(app.includes("if (e.code === 'AUTH_REQUIRED') sessionEnded("));
+  // read cache: this tab only, never while in-house data is shown, never the log
+  assert.ok(app.includes("if (treatOn() || !S.sess) return null;") && app.includes("if (!d || treatOn() || !S.sess) return;"));
+  assert.ok(!/localStorage\.setItem\(rcKey/.test(app) && app.includes("sessionStorage.setItem(rcKey(r), s)"));
   assert.ok(!/RC_PREFIX[^\n]*logs/.test(app));
-  // treatment view: token only in POST bodies / sessionStorage, never in a URL or the localStorage read cache
-  assert.ok(app.includes("sessionStorage.setItem(TT_KEY") && !/localStorage\.setItem\(TT_KEY/.test(app));
-  assert.ok(!/searchParams\.set\([^)]*treat/i.test(app) && app.includes("if (S.tt) body.treatToken = S.tt"));
-  assert.ok(app.includes("if (S.tt) return null;") && app.includes("if (!d || S.tt) return;"));
-  for (const a of ["'treat_unlock'", "'treat_lock'", "treat: () => txForm('treat')", "k !== 'treat' || treatOn()"]) assert.ok(app.includes(a), a);
-  // client-side checks mirror the server (2 decimals, ship <= balance)
-  assert.ok(app.includes("/^\\d+(\\.\\d{1,2})?$/"));
+  // roles: pages, menus and buttons by level (the server checks again)
+  assert.ok(app.includes("const PAGE_ROLE = { store: 'staff', ship: 'staff', treat: 'admin', logs: 'admin', settings: 'admin' };"));
+  assert.ok(app.includes("const treatOn = () => can('admin') && !S.hideT;") && app.includes("body.hideTreat = true"));
+  assert.ok(app.includes("const acts = m => !can('admin') ? '' :") && app.includes("${can('staff') ? `<div class=\"reset-topbar\">"));
+  for (const a of ["treat: () => txForm('treat')", "k !== 'treat' || treatOn()"]) assert.ok(app.includes(a), a);
+  // regression: the level painter must never match <body> (a fresh login hid the whole page)
+  assert.ok(app.includes("$$('.nav [data-role]').forEach(") && !/body\.dataset\.role|body\.setAttribute\('data-role'/.test(app));
+  // tons on the page: input / quick-add / exact conversion; kg only as a hint
+  assert.ok(app.includes("/^\\d+(\\.\\d{1,5})?$/") && app.includes("weight_t: tonsStr(parseT(F.weight))"));
+  assert.ok(app.includes("const QUICK_T = [0.1, 0.5, 1, 5, 10];"));
+  assert.ok(!/weight_kg: /.test(app), "the page never sends kg");
+  assert.ok(!/fmtKg\(|parseKg/.test(app));
+  assert.ok(app.includes("if (wt !== w0) {"), "edit sends weight_t only when changed");
+  const fx = new Function(app.match(/const fmt = [^\n]+/)[0] + "\n" + app.match(/const fmtT = [^\n]+/)[0] + "\n" +
+    app.slice(app.indexOf("const tonsStr = "), app.indexOf("/* ---------- container illustrations")) + "\nreturn { fmtT, tonsStr, parseT };")();
+  assert.strictEqual(fx.tonsStr(125), "0.125");
+  assert.strictEqual(fx.tonsStr(1234.56), "1.23456");
+  assert.strictEqual(fx.tonsStr(1000), "1");
+  assert.strictEqual(fx.tonsStr(100), "0.100");
+  assert.strictEqual(fx.tonsStr(0.01), "0.00001");
+  assert.strictEqual(fx.parseT("0.125"), 125);
+  assert.strictEqual(fx.parseT("1,234.5"), 1234500);
+  assert.strictEqual(fx.parseT("0.3"), 300);
+  assert.ok(isNaN(fx.parseT("0.000001")) && isNaN(fx.parseT("-1")) && isNaN(fx.parseT("1e3")));
+  for (const k of [0.01, 1, 99.99, 125, 1234.56, 54000]) assert.strictEqual(fx.parseT(fx.tonsStr(k)), k, "round trip " + k);
+  assert.ok(/^1,234\.56[0-9]*$/.test(fx.fmtT(1234560).replace(/[^\d.,]/g, "")) || fx.fmtT(1234560).includes("1,234.560"));
+  // client-side checks mirror the server (ship <= balance)
   assert.ok(app.includes("เกินยอดคงเหลือ"));
   // regressions: no global function named like a window property (history() replaced window.history)
   assert.ok(!/^(async )?function (history|location|name|status|close|open|print|stop|focus|blur|event)\(/m.test(app));
   // a save in flight: redrawing the summary (quick-add, typing, fresh data) never re-enables the button
   assert.ok(app.includes("if (!go || go.disabled || busy) return;") && app.includes("if (busy) { $('#fGo').disabled = true;"));
-  // Enter pressed again while a password is being checked: one request only
-  assert.strictEqual((app.match(/const submit = async \(\) => \{\r?\n\s+if \(ok\.disabled\) return;/g) || []).length, 2);
+  // Enter pressed again while a password is being checked: one request only (login)
+  assert.ok(/onsubmit = async e => \{\r?\n\s+e\.preventDefault\(\);\r?\n\s+if \(go\.disabled\) return;/.test(app));
+});
+
+test("rename: the in-house feature is “ข้อมูลภายใน” everywhere on screen (internal keys unchanged)", () => {
+  const app = readDoc("docs/assets/app.js"), html = readDoc("docs/index.html"), readme = readDoc("README.md");
+  const src = readDoc("apps-script/Code.gs");
+  // only data values may still contain the word (seed waste name, preset system names)
+  const strip = t => t.replace(/ตะกอนจากระบบบำบัดน้ำเสีย|ระบบบำบัดน้ำเสียภายในโรงงาน|บำบัดน้ำเสีย/g, "");
+  for (const [f, t] of [["app.js", app], ["index.html", html], ["Code.gs", src], ["README.md", readme]]) {
+    assert.ok(!/บำบัดเอง/.test(t), f + " still says บำบัดเอง");
+    assert.ok(!/บำบัด/.test(strip(t)), f + ": " + (strip(t).match(/.{0,30}บำบัด.{0,30}/) || [""])[0]);
+  }
+  assert.ok(app.includes("treat:   { name: 'ข้อมูลภายใน', short: 'ข้อมูลภายใน'"));
+  assert.ok(html.includes('<span>ข้อมูลภายใน</span>'));
+  assert.strictEqual(ctx.KIND_NAME.treat, "ข้อมูลภายใน");
+  assert.strictEqual(ctx.PREFIX.treat, "TR"); // doc numbers unchanged
+  assert.ok(ctx.KINDS.includes("treat") && ctx.ACTION_ROLE.treat === "admin"); // API action / kind unchanged
 });
 
 test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating icons, reduced motion, CDNs", () => {
@@ -1136,9 +1430,13 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(html.includes("https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"));
   assert.ok(html.includes("family=Kanit") && html.includes("Prompt"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"') && html.includes('data-page="settings"'));
-  assert.ok(/data-page="treat"[^>]*id="treatNav"/.test(html) && html.includes('class="tn-lock"') && html.includes('id="treatLock"'), "treatment menu always listed with a lock badge + lock control");
+  assert.ok(/data-page="treat"[^>]*id="treatNav" hidden/.test(html) && html.includes('id="treatLock" type="button" hidden'), "in-house menu + hide toggle hidden until an admin session");
+  // login screen + role-based menus + logout
+  assert.ok(html.includes('<div id="login" class="login">') && html.includes('id="logoutBtn"') && html.includes('id="roleTag"'));
+  for (const [pg, role] of [["store", "staff"], ["ship", "staff"], ["logs", "admin"], ["settings", "admin"]]) assert.ok(html.includes(`data-page="${pg}" data-role="${role}"`), pg);
+  assert.ok(css.includes(".login{position:fixed;inset:0;z-index:120") && css.includes(".login-logo{--sz:96px") && css.includes(".role-tag.r-admin"));
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
-  assert.ok(html.includes("assets/app.js?v=5") && html.includes("assets/style.css?v=3"));
+  assert.ok(html.includes("assets/app.js?v=6") && html.includes("assets/style.css?v=4"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });
