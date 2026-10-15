@@ -133,6 +133,7 @@ function unlockTreat() {
     const inp = $('#ttInput', card), ok = $('#ttOk', card), err = $('#ttErr', card);
     const done = v => { box.hidden = true; box.onclick = null; card.innerHTML = ''; resolve(v); };
     const submit = async () => {
+      if (ok.disabled) return; // Enter again while checking: one request (each wrong one counts toward the lockout)
       const pw = inp.value;
       if (!pw) { err.textContent = 'กรุณาใส่รหัสผ่าน'; inp.focus(); return; }
       ok.disabled = true; ok.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังตรวจสอบ...'; err.textContent = '';
@@ -190,6 +191,7 @@ function askPassword() {
     const done = () => { box.hidden = true; box.onclick = null; card.innerHTML = ''; };
     const cancel = () => { done(); reject(new Error('ยกเลิก — ต้องใส่รหัสผ่านผู้ดูแลก่อน')); };
     const submit = async () => {
+      if (ok.disabled) return; // Enter again while checking: one request (each wrong one counts toward the lockout)
       const pw = inp.value;
       if (!pw) { err.textContent = 'กรุณาใส่รหัสผ่าน'; inp.focus(); return; }
       ok.disabled = true; ok.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังตรวจสอบ...'; err.textContent = '';
@@ -448,7 +450,7 @@ function pageReads(p) {
 const currentPage = () => { const page = (location.hash.slice(1) || 'dashboard').split('?')[0]; return PAGES[page] ? page : 'dashboard'; };
 const routeReads = (p = currentPage()) => [['bootstrap', ''], ...pageReads(p)];
 const PAGE_FN = {
-  dashboard: ([d]) => dashboard(d), history: ([h]) => history(h), balance, logs, settings,
+  dashboard: ([d]) => dashboard(d), history: ([h]) => historyPage(h), balance, logs, settings,
   store: () => txForm('store'), ship: () => txForm('ship'), treat: () => txForm('treat'),
 };
 ['input', 'change'].forEach(ev => view.addEventListener(ev, () => { S.dirty = true; }, true));
@@ -763,6 +765,7 @@ function txForm(page) {
     }).join('');
   };
   const pick = () => { $('#tPick').innerHTML = typePicker(F.type_id, out ? 'ship' : 'store', F.q); };
+  let busy = false; // a save is in flight: the button stays disabled even if the summary is redrawn
   const errs = () => {
     const e = {};
     const w = parseKg(F.weight);
@@ -805,6 +808,7 @@ function txForm(page) {
       <button class="btn btn-lg ${ship ? 'btn-ship' : treat ? 'btn-treat' : 'btn-primary'}" id="fGo" ${ok ? '' : 'disabled'}><i class="fa-solid ${ship ? 'fa-truck-arrow-right' : treat ? 'fa-flask-vial' : 'fa-floppy-disk'}"></i>${ship ? 'ยืนยันส่งกำจัด' : treat ? 'ยืนยันบำบัดเอง' : F.kind === 'opening' ? 'บันทึกยอดยกมา' : 'บันทึกจัดเก็บ'}</button>
       <p class="hint" style="margin-top:10px;text-align:center">${ok ? '<i class="fa-solid fa-circle-check" style="color:var(--ok)"></i> พร้อมบันทึก' : esc(Object.values(e)[0])}</p>`;
     $('#fGo').onclick = submit;
+    if (busy) { $('#fGo').disabled = true; $('#fGo').innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังบันทึก...'; }
     const we = e.w && F.weight !== '';
     $('#wBox').classList.toggle('bad', !!we);
     $('#wHelp').textContent = we ? e.w : (out && t ? `${treat ? 'บำบัด' : 'ส่ง'}ได้ไม่เกิน ${fmtKg(balOf(t.id).balance_kg)} กก.` : '\u00a0');
@@ -821,10 +825,10 @@ function txForm(page) {
   };
   async function submit() {
     const go = $('#fGo');
-    if (!go || go.disabled) return;
+    if (!go || go.disabled || busy) return;
     const e = errs();
     if (Object.keys(e).length) { toast(Object.values(e)[0], 'err'); return; }
-    go.disabled = true; go.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังบันทึก...';
+    busy = true; go.disabled = true; go.innerHTML = '<i class="fa-solid fa-recycle fa-spin"></i> กำลังบันทึก...';
     const body = { type_id: F.type_id, weight_kg: String(parseKg(F.weight)), container: F.container, containers: String(F.containers), date: F.date, time: F.time, note: F.note };
     if (ship) Object.assign(body, { manifest_no: F.manifest_no, vehicle: F.vehicle });
     else if (treat) body.method = F.method;
@@ -847,6 +851,7 @@ function txForm(page) {
       S.onModalClose = () => route();
       m.querySelector('[data-close].btn-primary')?.focus();
     } catch (err) {
+      busy = false;
       toast(err.message, 'err');
       if (err.code === 'TREAT_LOCKED') { location.hash = 'dashboard'; return; }
       summary();
@@ -948,7 +953,8 @@ const typeOptions = (sel, filter = () => true) => receivers().map(r => {
   const ts = S.types.filter(t => t.receiver === r && (filter(t) || +t.id === +sel));
   return ts.length ? `<optgroup label="${esc(r)}">${ts.map(t => `<option value="${t.id}" ${+t.id === +sel ? 'selected' : ''}>${esc(t.code)} · ${esc(t.name)}</option>`).join('')}</optgroup>` : '';
 }).join('');
-function history(initial) {
+// not named history(): a global function declaration would replace window.history
+function historyPage(initial) {
   const n = nowParts();
   view.innerHTML = `<div class="card">
     <div class="filters">

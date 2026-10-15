@@ -1039,6 +1039,50 @@ test("sheet storage: numbers / codes / dates keep their formats (no Date convers
   assert.strictEqual(typeof mvRow[4], "number");
 });
 
+/* ---------- regressions (bug hunt 2026-10) ---------- */
+test("hidden mode: balance last_at never reveals the time of a treatment row", () => {
+  const s = okData(mv("store", 2, 40, { container: "ibc", containers: 2, ...at(10) }));
+  okData(mv("treat", 2, 5, { container: "ibc", containers: 1, treatToken: TT, ...at(1) }));
+  const atStore = okData(get("history", { type: "2" })).items.find(m => m.doc_no === s.doc_no).moved_at;
+  const hidden = boot().balance[2];
+  assert.strictEqual(hidden.last_at, atStore);
+  assert.ok(!("last_vis_at" in hidden) && !("treated_kg" in hidden));
+  const shown = tread(TT, "bootstrap").balance[2];
+  assert.strictEqual(shown.last_at, at(1).date + " 09:00:00");
+  assert.ok(!("last_vis_at" in shown));
+  assert.strictEqual(hidden.balance_kg, shown.balance_kg); // the balance itself stays true
+  assert.strictEqual(okData(get("batch", { reads: JSON.stringify(["bootstrap"]) })).results[0].balance[2].last_at, atStore);
+});
+
+test("movement_update: an empty date / time keeps the stored moment (not silently moved to now)", () => {
+  const s = okData(mv("store", 2, 3, { container: "ibc", containers: 1, ...at(8, 7, 15) }));
+  const r = okData(post("movement_update", { id: s.id, doc_no: s.doc_no, weight_kg: "4", date: "", time: "" }));
+  assert.strictEqual(r.changed, true);
+  const row = okData(get("history", { type: "2" })).items.find(m => m.id === s.id);
+  assert.strictEqual(row.moved_at, at(8).date + " 07:15:00");
+  assert.strictEqual(row.weight_kg, 4);
+  // only the time cleared: the date given is used, the stored time kept
+  okData(post("movement_update", { id: s.id, doc_no: s.doc_no, date: at(9).date, time: "" }));
+  assert.strictEqual(okData(get("history", { type: "2" })).items.find(m => m.id === s.id).moved_at, at(9).date + " 07:15:00");
+});
+
+test("CSV: a note with backslash + quote stays in one Excel cell (RFC 4180 quote doubling)", () => {
+  const s = okData(mv("store", 2, 1, { container: "ibc", containers: 1, note: 'ท่อ 3\\" ยาว "พิเศษ"', ...at(1) }));
+  const csv = okData(get("export", { type: "2" })).csv;
+  const line = csv.split("\n").find(x => x.startsWith(s.doc_no));
+  // minimal RFC 4180 reader (what Excel does): "" inside quotes is one quote, backslash is plain text
+  const cells = [];
+  for (let i = 0, cur = "", q = false; i <= line.length; i++) {
+    const ch = line[i];
+    if (q) { if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; } else if (ch === '"') q = false; else cur += ch; }
+    else if (ch === '"') q = true;
+    else if (ch === "," || ch === undefined) { cells.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  assert.strictEqual(cells.length, 16, line);
+  assert.strictEqual(cells[14], 'ท่อ 3\\" ยาว "พิเศษ"');
+});
+
 /* ---------- frontend ---------- */
 const readDoc = f => fs.readFileSync(path.join(ROOT, f), "utf8");
 test("docs JS files parse; config shape; GET with _=ts; POST text/plain; actor sent; UTF-8 BOM CSV", () => {
@@ -1067,6 +1111,12 @@ test("docs JS files parse; config shape; GET with _=ts; POST text/plain; actor s
   // client-side checks mirror the server (2 decimals, ship <= balance)
   assert.ok(app.includes("/^\\d+(\\.\\d{1,2})?$/"));
   assert.ok(app.includes("เกินยอดคงเหลือ"));
+  // regressions: no global function named like a window property (history() replaced window.history)
+  assert.ok(!/^(async )?function (history|location|name|status|close|open|print|stop|focus|blur|event)\(/m.test(app));
+  // a save in flight: redrawing the summary (quick-add, typing, fresh data) never re-enables the button
+  assert.ok(app.includes("if (!go || go.disabled || busy) return;") && app.includes("if (busy) { $('#fGo').disabled = true;"));
+  // Enter pressed again while a password is being checked: one request only
+  assert.strictEqual((app.match(/const submit = async \(\) => \{\r?\n\s+if \(ok\.disabled\) return;/g) || []).length, 2);
 });
 
 test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating icons, reduced motion, CDNs", () => {
@@ -1088,7 +1138,7 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"') && html.includes('data-page="settings"'));
   assert.ok(/data-page="treat"[^>]*id="treatNav"/.test(html) && html.includes('class="tn-lock"') && html.includes('id="treatLock"'), "treatment menu always listed with a lock badge + lock control");
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
-  assert.ok(html.includes("assets/app.js?v=4") && html.includes("assets/style.css?v=3"));
+  assert.ok(html.includes("assets/app.js?v=5") && html.includes("assets/style.css?v=3"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });

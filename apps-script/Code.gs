@@ -432,7 +432,7 @@ function balances_() {
   table_("waste_types").rows.forEach(function (t) {
     out[t.id] = {
       type_id: t.id, stored_c: 0, opening_c: 0, shipped_c: 0, year_c: 0, treated_c: 0, treat_year_c: 0,
-      containers: { drum200: 0, ibc: 0, bigbag: 0 }, last_at: null
+      containers: { drum200: 0, ibc: 0, bigbag: 0 }, last_at: null, last_vis_at: null
     };
     fifo[t.id] = [];
   });
@@ -452,6 +452,7 @@ function balances_() {
     }
     if (b.containers[m.container] !== undefined) b.containers[m.container] += sign * (m.containers || 0);
     b.last_at = m.moved_at;
+    if (m.kind !== "treat") b.last_vis_at = m.moved_at; // latest movement a hidden-mode request may see
     // FIFO lots: what is shipped / treated leaves the oldest lot first.
     var q = fifo[m.type_id];
     if (sign > 0) q.push({ at: m.moved_at, c: c });
@@ -486,7 +487,8 @@ function balances_() {
       quota_level: quotaLevel_(b.year_c, permitC),
       oldest_at: oldest,
       age_days: oldest ? Math.max(0, Math.floor((nowMs - parseDt_(oldest)) / 86400000)) : null,
-      last_at: b.last_at
+      last_at: b.last_at,
+      last_vis_at: b.last_vis_at
     };
   });
   return out;
@@ -495,12 +497,16 @@ function balances_() {
 // Balances as sent to a request: without the treatment totals when it may not
 // see treatment (the balance itself is unchanged).
 function publicBalances_(bal) {
-  if (treatOn_()) return bal;
+  var showTreat = treatOn_();
   var out = {};
   Object.keys(bal).forEach(function (id) {
     var o = plain_(bal[id]);
-    delete o.treated_kg;
-    delete o.treated_year_kg;
+    if (!showTreat) {
+      delete o.treated_kg;
+      delete o.treated_year_kg;
+      o.last_at = o.last_vis_at; // the time of a treatment row is not shown either
+    }
+    delete o.last_vis_at;
     out[id] = o;
   });
   return out;
@@ -829,8 +835,9 @@ function moveFields_(kind, input, base) {
   if (!/^\d{1,6}$/.test(cRaw) || Number(cRaw) < 1) fail_("จำนวนภาชนะต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป");
   var at;
   if (base && input.date === undefined && input.time === undefined) at = base.moved_at;
-  else at = moment_({ date: input.date == null && base ? base.moved_at.slice(0, 10) : input.date,
-    time: input.time == null && base ? base.moved_at.slice(11, 16) : input.time });
+  // edit: an empty / missing date or time keeps the stored one (never silently "now")
+  else at = moment_({ date: (input.date == null || input.date === "") && base ? base.moved_at.slice(0, 10) : input.date,
+    time: (input.time == null || input.time === "") && base ? base.moved_at.slice(11, 16) : input.time });
   if (parseDt_(at) > Date.now() + TZ_OFFSET_MS + FUTURE_SLACK_MS) fail_("วันที่/เวลาต้องไม่เกินเวลาปัจจุบัน");
   var text = function (k, max, label) {
     var v = pick(k);
@@ -1701,21 +1708,14 @@ function escapeRe_(ch) {
   return ch.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
 }
 
-// PHP fputcsv() with default delimiter/enclosure/escape, "\n" line ending.
+// CSV line: quoted when PHP fputcsv() would quote, "\n" line ending.
 function csvLine_(fields) {
   return fields.map(function (f) {
     var s = f === null || f === undefined ? "" : (f === true ? "1" : f === false ? "" : String(f));
     if (!/[,"\\\n\r\t ]/.test(s)) return s;
-    var out = '"';
-    var escaped = false;
-    for (var i = 0; i < s.length; i++) {
-      var ch = s.charAt(i);
-      if (ch === "\\") escaped = true;
-      else if (!escaped && ch === '"') out += '"';
-      else escaped = false;
-      out += ch;
-    }
-    return out + '"';
+    // Every '"' doubled (RFC 4180, how Excel reads it). PHP's backslash escape left
+    // '\"' undoubled, which split the cell into two columns in Excel.
+    return '"' + s.replace(/"/g, '""') + '"';
   }).join(",") + "\n";
 }
 
