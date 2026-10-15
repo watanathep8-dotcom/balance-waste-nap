@@ -101,7 +101,9 @@ S.tt = ttLoad();
 const treatOn = () => !!S.tt;
 function paintTreat() {
   const on = treatOn();
-  $('#treatNav').hidden = !on;
+  // the menu is always there; while locked it carries a lock badge and asks for the admin password on click
+  $('#treatNav').classList.toggle('locked', !on);
+  $('#treatNav').title = on ? '' : 'ต้องใส่รหัสผ่านผู้ดูแลเพื่อเปิด';
   const b = $('#treatLock');
   b.classList.toggle('on', on);
   b.innerHTML = `<i class="fa-solid ${on ? 'fa-lock-open' : 'fa-lock'}"></i>`;

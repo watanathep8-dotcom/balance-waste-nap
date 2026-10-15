@@ -602,3 +602,8 @@ tr:hover td{background:rgba(16,185,129,.04)}
   .leaves{display:none}
   .programming-credit{animation:none;color:#22c55e}
 }
+
+/* บำบัดเองภายใน menu: always listed, locked until the admin password is given */
+.nav a.treat-nav .tn-lock{margin-left:auto;font-size:11px;opacity:.75;display:none}
+.nav a.treat-nav.locked .tn-lock{display:inline-block}
+.nav a.treat-nav.locked .tn-lock i{animation:none;color:#DDD6FE}
