@@ -39,7 +39,7 @@
  *
  * Units: the sheet stores kilograms (weight_kg, 0.01 kg precision; existing
  * rows are kg). The page sends weight_t (tons, up to 5 decimals = 0.01 kg;
- * normally 3 = 1 kg) and the server converts exactly: kg = round(t * 100000) / 100.
+ * the page shows 2) and the server converts exactly: kg = round(t * 100000) / 100.
  * API numbers stay *_kg; every text the server writes (messages, audit log,
  * CSV) shows tons.
  *
@@ -82,7 +82,7 @@ var ACTION_ROLE = {
   bootstrap: PUBLIC, dashboard: PUBLIC, history: PUBLIC, "export": PUBLIC, batch: PUBLIC,
   store: PUBLIC, opening: PUBLIC, ship: PUBLIC,
   treat: "staff",
-  movement_update: "admin", movement_delete: "admin", type_save: "admin",
+  movement_update: "admin", movement_delete: "admin", type_save: "admin", receiver_save: "admin", receiver_delete: "admin", type_delete: "admin",
   reset_data: "admin", logs: "admin", logs_export: "admin"
 };
 var SESSION_PREFIX = "WASTE_SS_";
@@ -114,7 +114,8 @@ var OUT_KINDS = ["ship", "treat"]; // leave the in-plant balance
 var PREFIX = { store: "ST", ship: "SH", opening: "OB", treat: "TR" };
 var ACT_NAME = {
   store: "บันทึกจัดเก็บ", ship: "ส่งกำจัด", opening: "ยอดยกมา", treat: "บันทึกข้อมูลภายใน",
-  movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ", type_save: "ตั้งค่าประเภทของเสีย"
+  movement_update: "แก้ไขรายการ", movement_delete: "ลบรายการ", type_save: "ตั้งค่าประเภทของเสีย",
+  receiver_save: "ตั้งค่าผู้รับดำเนินการ", receiver_delete: "ลบผู้รับดำเนินการ", type_delete: "ลบประเภทของเสีย"
 };
 var LOG_CAT_NAME = { waste: "ของเสีย", edit: "แก้ไข / ลบ", setting: "ตั้งค่า", warn: "ถูกปฏิเสธ" };
 
@@ -133,6 +134,14 @@ var SCHEMA = {
     ["receiver_reg", "str"], ["receiver", "str"], ["icon", "str"], ["color", "str"], ["active", "int"],
     ["sort", "int"], ["updated_at", "dt?"], ["updated_by", "str"]
   ],
+  // Receivers (ผู้รับดำเนินการ). A type keeps its receiver name + registration
+  // (waste_types.receiver / receiver_reg) as before; this sheet only adds the
+  // receivers that have no type yet, an optional default management code and the
+  // active flag. Older sheets are created and seeded from the types (ensureReceivers_).
+  receivers: [
+    ["id", "int"], ["name", "str"], ["reg", "str"], ["mgmt_code", "str"], ["active", "int"],
+    ["sort", "int"], ["updated_at", "dt?"], ["updated_by", "str"]
+  ],
   movements: [
     ["id", "int"], ["doc_no", "str"], ["kind", "str"], ["type_id", "int"], ["weight_kg", "num"],
     ["container", "str"], ["containers", "int"], ["location", "str"], ["manifest_no", "str"], ["vehicle", "str"],
@@ -144,8 +153,8 @@ var SCHEMA = {
     ["actor", "str"], ["created_at", "dt"]
   ]
 };
-var TABLE_ORDER = ["waste_types", "movements", "audit_logs"];
-var AUTO_CREATE_TABLES = [];
+var TABLE_ORDER = ["waste_types", "receivers", "movements", "audit_logs"];
+var AUTO_CREATE_TABLES = ["receivers"];
 
 // [code, name, permit tons, management code, receiver registration, receiver, icon, colour]
 // From Waste_Summary_Report_NAP_Nutriscience_2569.xlsx (สก.2 เลขที่ 2569-8409, ปี 2569).
@@ -178,7 +187,7 @@ var BATCH_MAX = 6;
  * write bumps right after its changes are flushed (see flush_). Writes always
  * read the sheets live under the script lock. Hand edits in the spreadsheet
  * show up after READ_CACHE_TTL seconds, or at once after clearReadCache(). */
-var CACHED_TABLES = ["waste_types", "movements", "audit_logs"];
+var CACHED_TABLES = ["waste_types", "receivers", "movements", "audit_logs"];
 var VERSION_PREFIX = "WASTE_V_";
 var VERSION_TTL = 21600;
 var RC_PREFIX = "WASTE_RC_";
@@ -187,7 +196,7 @@ var KEEP_WARM_TTL = 900;
 var KEEP_WARM_MINUTES = 10;
 var RC_CHUNK = 30000;
 var RC_MAX_CHUNKS = 30;
-var WRITE_ACTIONS = ["store", "ship", "opening", "treat", RESET_ACTION, "movement_update", "movement_delete", "type_save"];
+var WRITE_ACTIONS = ["store", "ship", "opening", "treat", RESET_ACTION, "movement_update", "movement_delete", "type_save", "receiver_save", "receiver_delete", "type_delete"];
 
 var MAX_PERSON = 100;
 var MAX_TEXT = 255;
@@ -528,6 +537,9 @@ function handleWrite_(action, input) {
     case "movement_update": return actionMovementUpdate_(input);
     case "movement_delete": return actionMovementDelete_(input);
     case "type_save": return actionTypeSave_(input);
+    case "receiver_save": return actionReceiverSave_(input);
+    case "receiver_delete": return actionReceiverDelete_(input);
+    case "type_delete": return actionTypeDelete_(input);
   }
   fail_("Unknown action");
 }
@@ -696,11 +708,15 @@ function typeLabel_(id) {
 
 function actionBootstrap_() {
   var now = nowParts_();
-  var core = cachedDerived_("boot3_" + modeTag_() + now.date, ["waste_types", "movements"], function () {
-    return { types: sortedTypes_().map(plain_), balance: publicBalances_(balances_()) };
+  var core = cachedDerived_("boot4_" + modeTag_() + now.date, ["waste_types", "receivers", "movements"], function () {
+    var used = {};
+    visibleMoves_().forEach(function (m) { used[m.type_id] = true; });
+    var types = sortedTypes_().map(function (t) { var o = plain_(t); o.has_moves = used[t.id] === true; return o; });
+    return { types: types, receivers: receiverStats_(types), balance: publicBalances_(balances_()) };
   });
   return {
     types: core.types,
+    receivers: core.receivers,
     balance: core.balance,
     treat: treatOn_(),
     role: (REQ_ && REQ_.role) || null,
@@ -731,7 +747,7 @@ function actionDashboard_() {
   // series) only for a session (aggOn_); individual in-house rows never appear.
   // ("4" in the cache ids: a new shape, never reuse a cached answer of the previous version)
   var agg = aggOn_();
-  var core = cachedDerived_("dash4_" + (agg ? "a" : "p") + now.date, ["waste_types", "movements", "audit_logs"], function () {
+  var core = cachedDerived_("dash5_" + (agg ? "a" : "p") + now.date, ["waste_types", "receivers", "movements", "audit_logs"], function () {
     var types = sortedTypes_();
     var bal = balances_();
     var moves = table_("movements").rows;
@@ -766,8 +782,6 @@ function actionDashboard_() {
 
     var totalBal = 0, totalYear = 0, totalPermit = 0, totalIn = 0, totalShip = 0, totalTreat = 0;
     var containers = { drum200: 0, ibc: 0, bigbag: 0 };
-    var receivers = {};
-    var recvOrder = [];
     var alerts = [];
     types.forEach(function (t) {
       var b = bal[t.id];
@@ -776,12 +790,6 @@ function actionDashboard_() {
       totalPermit += cents_(b.permit_kg);
       totalIn += cents_(b.in_kg); totalShip += cents_(b.shipped_kg); totalTreat += cents_(b.treated_kg);
       CONTAINER_KEYS.forEach(function (k) { containers[k] += Math.max(0, b.containers[k]); });
-      if (!receivers[t.receiver]) {
-        receivers[t.receiver] = { receiver: t.receiver, permit_c: 0, year_c: 0, balance_c: 0, types: 0 };
-        recvOrder.push(t.receiver);
-      }
-      var r = receivers[t.receiver];
-      r.permit_c += cents_(b.permit_kg); r.year_c += cents_(b.shipped_year_kg); r.balance_c += cents_(b.balance_kg); r.types += 1;
       if (b.quota_level !== "ok") {
         alerts.push({ level: b.quota_level === "over" ? "bad" : "warn", kind: "quota", type_id: t.id, pct: b.quota_pct,
           used_kg: b.shipped_year_kg, permit_kg: b.permit_kg });
@@ -819,12 +827,13 @@ function actionDashboard_() {
         return o;
       }),
       containers: containers,
-      receivers: recvOrder.map(function (k) {
-        var r = receivers[k];
+      receivers: receiverStats_(types.map(plain_), bal).filter(function (r) { return r.active === 1 || r.shipped_year_kg > 0 || r.balance_kg > 0; }).map(function (r) {
+        var permitC = Math.round(r.permit_tons * 100000);
+        var yearC = cents_(r.shipped_year_kg);
         return {
-          receiver: r.receiver, types: r.types, permit_kg: kgOf_(r.permit_c), shipped_year_kg: kgOf_(r.year_c),
-          balance_kg: kgOf_(r.balance_c), quota_pct: r.permit_c > 0 ? Math.round(r.year_c / r.permit_c * 1000) / 10 : null,
-          quota_level: quotaLevel_(r.year_c, r.permit_c)
+          id: r.id, receiver: r.name, types: r.active_types, permit_kg: kgOf_(permitC), shipped_year_kg: r.shipped_year_kg,
+          balance_kg: r.balance_kg, quota_pct: permitC > 0 ? Math.round(yearC / permitC * 1000) / 10 : null,
+          quota_level: quotaLevel_(yearC, permitC)
         };
       }),
       alerts: alerts,
@@ -1082,6 +1091,66 @@ function actionMovementDelete_(input) {
   return { id: m.id, doc_no: m.doc_no, message: "ลบรายการ " + m.doc_no + " แล้ว" };
 }
 
+/* ---------- receivers (ผู้รับดำเนินการ) ---------- */
+
+function recvKey_(name) {
+  return String(name || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+// Receivers: the receivers sheet plus any receiver named by a type that is not
+// listed there yet (older data; id 0 until ensureReceivers_ stores it).
+function receiverList_() {
+  var rows = sortBy_(table_("receivers").rows.slice(), function (a, b) { return a.sort - b.sort || a.id - b.id; }).map(plain_);
+  var seen = {};
+  rows.forEach(function (r) { seen[recvKey_(r.name)] = true; });
+  var next = rows.reduce(function (m, r) { return Math.max(m, r.sort); }, 0);
+  sortedTypes_().forEach(function (t) {
+    var k = recvKey_(t.receiver);
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    rows.push({ id: 0, name: t.receiver, reg: t.receiver_reg || "", mgmt_code: "", active: 1, sort: ++next });
+  });
+  return rows;
+}
+
+// Stores the derived receivers (inside a write, under the lock). Idempotent.
+function ensureReceivers_() {
+  var at = nowParts_().datetime;
+  receiverList_().forEach(function (r) {
+    if (r.id) return;
+    insert_("receivers", { name: r.name, reg: r.reg, mgmt_code: "", active: 1, sort: r.sort, updated_at: at, updated_by: REQ_.actor });
+  });
+}
+
+// Per receiver: types, permitted tons of its ACTIVE types, this year's shipments
+// of those types and the in-plant balance. A receiver without types has 0 quota.
+function receiverStats_(types, bal) {
+  var list = receiverList_();
+  var byKey = {};
+  list.forEach(function (r) {
+    r.types = 0; r.active_types = 0; r.permit_c = 0; r.year_c = 0; r.balance_c = 0;
+    byKey[recvKey_(r.name)] = r;
+  });
+  types.forEach(function (t) {
+    var r = byKey[recvKey_(t.receiver)];
+    if (!r) return;
+    var b = bal && bal[t.id];
+    r.types += 1;
+    if (b) r.balance_c += cents_(b.balance_kg);
+    if (+t.active === 1) {
+      r.active_types += 1;
+      r.permit_c += Math.round(Number(t.permit_tons || 0) * 100000);
+      if (b) r.year_c += cents_(b.shipped_year_kg);
+    }
+  });
+  return list.map(function (r) {
+    return {
+      id: r.id, name: r.name, reg: r.reg, mgmt_code: r.mgmt_code, active: r.active, types: r.types, active_types: r.active_types,
+      permit_tons: r.permit_c / 100000, shipped_year_kg: kgOf_(r.year_c), balance_kg: kgOf_(r.balance_c)
+    };
+  });
+}
+
 /* ---------- waste types (WASTE_RESET_PASSWORD) ---------- */
 
 function actionTypeSave_(input) {
@@ -1095,43 +1164,136 @@ function actionTypeSave_(input) {
   if (!/^\d{6}$/.test(code)) fail_("รหัสของเสียต้องเป็นตัวเลข 6 หลัก");
   var name = textIn_(input, "name", 120, "ชื่อของเสีย");
   if (!name) fail_("กรุณากรอกชื่อของเสีย");
-  var tons = numIn_(input.permit_tons, "ปริมาณที่ได้รับอนุญาต (ตัน)", 3);
+  var tons = numIn_(input.permit_tons, "ปริมาณที่ได้รับอนุญาต (ตัน)", 2);
   if (tons > MAX_PERMIT_TONS) fail_("ปริมาณที่ได้รับอนุญาตสูงเกินไป");
+  ensureReceivers_();
+  // The receiver: receiver_id (a listed receiver) or, for older callers, a name
+  // (an existing receiver of that name, otherwise a new one is added).
+  var rcv = null, newRcv = null;
+  var rid = phpInt_(input.receiver_id);
+  var givenReg = phpTrim_(safeStr_(input.receiver_reg));
+  if (rid) {
+    rcv = table_("receivers").rows.filter(function (r) { return r.id === rid; })[0];
+    if (!rcv) fail_("ไม่พบผู้รับดำเนินการนี้");
+  } else {
+    var rname = textIn_(input, "receiver", 120, "ผู้รับดำเนินการ").replace(/\s+/g, " ");
+    if (!rname) fail_("กรุณาเลือกหรือกรอกชื่อผู้รับดำเนินการ");
+    if (!/^\d{0,20}$/.test(givenReg)) fail_("เลขทะเบียนผู้รับต้องเป็นตัวเลข (ไม่เกิน 20 หลัก)");
+    rcv = table_("receivers").rows.filter(function (r) { return recvKey_(r.name) === recvKey_(rname); })[0] || null;
+    if (!rcv) newRcv = { name: rname, reg: givenReg };
+  }
   var mgmt = phpTrim_(safeStr_(input.mgmt_code));
+  if (!mgmt && rcv && rcv.mgmt_code) mgmt = rcv.mgmt_code;
   if (!/^\d{3}$/.test(mgmt)) fail_("รหัสวิธีการจัดการต้องเป็นตัวเลข 3 หลัก");
-  var reg = phpTrim_(safeStr_(input.receiver_reg));
-  if (!/^\d{0,20}$/.test(reg)) fail_("เลขทะเบียนผู้รับต้องเป็นตัวเลข (ไม่เกิน 20 หลัก)");
-  var receiver = textIn_(input, "receiver", 120, "ผู้รับดำเนินการ");
-  if (!receiver) fail_("กรุณากรอกชื่อผู้รับดำเนินการ");
   var icon = phpTrim_(safeStr_(input.icon)) || (existing ? existing.icon : "fa-recycle");
   if (!/^fa-[a-z0-9-]{1,40}$/.test(icon)) fail_("ไอคอนไม่ถูกต้อง");
   var color = phpTrim_(safeStr_(input.color)) || (existing ? existing.color : "#10B981");
   if (!/^#[0-9a-fA-F]{6}$/.test(color)) fail_("สีไม่ถูกต้อง");
   var active = input.active === undefined ? (existing ? existing.active : 1) : (phpTruthy_(input.active) && str_(input.active) !== "false" ? 1 : 0);
+  if (active === 1 && rcv && rcv.active !== 1) fail_("ผู้รับดำเนินการนี้ปิดใช้งานอยู่ — เปิดใช้งานผู้รับก่อน");
+  var rName = rcv ? rcv.name : newRcv.name;
+  var rReg = rcv ? rcv.reg : newRcv.reg;
+  if (rcv && !rcv.reg && !rid && /^\d{1,20}$/.test(givenReg)) rReg = givenReg; // older caller names the registration
   var dup = table_("waste_types").rows.some(function (t) {
-    return t !== existing && t.code === code && t.mgmt_code === mgmt && t.receiver_reg === reg && t.name === name;
+    return t !== existing && t.code === code && t.mgmt_code === mgmt && t.receiver_reg === rReg && t.name === name;
   });
   if (dup) fail_("มีประเภทของเสียนี้ (รหัส ชื่อ วิธีจัดการ และผู้รับเดียวกัน) อยู่แล้ว");
+  var at = nowParts_().datetime;
+  var createdReceiver = false;
+  if (newRcv) {
+    var maxRs = 0;
+    table_("receivers").rows.forEach(function (r) { if (r.sort > maxRs) maxRs = r.sort; });
+    rcv = insert_("receivers", { name: newRcv.name, reg: newRcv.reg, mgmt_code: "", active: 1, sort: maxRs + 1, updated_at: at, updated_by: REQ_.actor });
+    audit_("setting", "receiver_save", "เพิ่มผู้รับดำเนินการ #" + rcv.id + ": " + rcv.name + (rcv.reg ? " (" + rcv.reg + ")" : ""), "R" + rcv.id);
+    createdReceiver = true;
+  } else if (rcv.reg !== rReg) {
+    update_("receivers", rcv, { reg: rReg, updated_at: at, updated_by: REQ_.actor });
+  }
   var fields = {
-    code: code, name: name, permit_tons: tons, mgmt_code: mgmt, receiver_reg: reg, receiver: receiver,
-    icon: icon, color: color.toUpperCase(), active: active, updated_at: nowParts_().datetime, updated_by: REQ_.actor
+    code: code, name: name, permit_tons: tons, mgmt_code: mgmt, receiver_reg: rReg, receiver: rName,
+    icon: icon, color: color.toUpperCase(), active: active, updated_at: at, updated_by: REQ_.actor
   };
-  var desc = code + " " + name + " · อนุญาต " + tons + " ตัน · รหัสจัดการ " + mgmt + " · " + receiver +
-    (reg ? " (" + reg + ")" : "") + " · " + (active ? "ใช้งาน" : "ปิดใช้งาน");
+  var desc = code + " " + name + " · อนุญาต " + tons + " ตัน · รหัสจัดการ " + mgmt + " · " + rName +
+    (rReg ? " (" + rReg + ")" : "") + " · " + (active ? "ใช้งาน" : "ปิดใช้งาน");
   if (existing) {
     var before = existing.code + " " + existing.name + " · อนุญาต " + existing.permit_tons + " ตัน · รหัสจัดการ " +
       existing.mgmt_code + " · " + existing.receiver + (existing.receiver_reg ? " (" + existing.receiver_reg + ")" : "") +
       " · " + (existing.active ? "ใช้งาน" : "ปิดใช้งาน");
     update_("waste_types", existing, fields);
     audit_("setting", "type_save", "แก้ไขประเภทของเสีย #" + existing.id + " — เดิม: " + before + " → ใหม่: " + desc, "T" + existing.id);
-    return { id: existing.id, created: false, message: "บันทึกประเภทของเสีย " + name + " แล้ว" };
+    return { id: existing.id, created: false, receiver_id: rcv.id, receiver_created: createdReceiver, message: "บันทึกประเภทของเสีย " + name + " แล้ว" };
   }
   var maxSort = 0;
   table_("waste_types").rows.forEach(function (t) { if (t.sort > maxSort) maxSort = t.sort; });
   fields.sort = maxSort + 1;
   var row = insert_("waste_types", fields);
   audit_("setting", "type_save", "เพิ่มประเภทของเสีย #" + row.id + ": " + desc, "T" + row.id);
-  return { id: row.id, created: true, message: "เพิ่มประเภทของเสีย " + name + " แล้ว" };
+  return { id: row.id, created: true, receiver_id: rcv.id, receiver_created: createdReceiver, message: "เพิ่มประเภทของเสีย " + name + " แล้ว" };
+}
+
+// A type that has movements can only be deactivated (history keeps its name).
+function actionTypeDelete_(input) {
+  var t = typeMap_()[phpInt_(input.id)];
+  if (!t) fail_("ไม่พบประเภทของเสียนี้");
+  var used = table_("movements").rows.some(function (m) { return m.type_id === t.id; });
+  if (used) fail_("ประเภทของเสียนี้มีรายการเคลื่อนไหวแล้ว ลบไม่ได้ — ให้ปิดใช้งานแทน");
+  delete_("waste_types", t);
+  audit_("setting", "type_delete", "ลบประเภทของเสีย #" + t.id + ": " + t.code + " " + t.name + " · " + t.receiver, "T" + t.id);
+  return { id: t.id, message: "ลบประเภทของเสีย " + t.name + " แล้ว" };
+}
+
+function actionReceiverSave_(input) {
+  ensureReceivers_();
+  var rows = table_("receivers").rows;
+  var existing = null;
+  var id = phpInt_(input.id);
+  var cur = phpEmpty_(input.current_name) ? "" : recvKey_(safeStr_(input.current_name));
+  if (id) existing = rows.filter(function (r) { return r.id === id; })[0] || null;
+  else if (cur) existing = rows.filter(function (r) { return recvKey_(r.name) === cur; })[0] || null;
+  if ((id || cur) && !existing) fail_("ไม่พบผู้รับดำเนินการนี้");
+  var name = textIn_(input, "name", 120, "ชื่อผู้รับดำเนินการ").replace(/\s+/g, " ");
+  if (!name) fail_("กรุณากรอกชื่อผู้รับดำเนินการ");
+  var reg = phpTrim_(safeStr_(input.reg !== undefined ? input.reg : input.receiver_reg));
+  if (!/^\d{0,20}$/.test(reg)) fail_("เลขทะเบียนผู้รับต้องเป็นตัวเลข (ไม่เกิน 20 หลัก)");
+  var mgmt = phpTrim_(safeStr_(input.mgmt_code));
+  if (!/^(\d{3})?$/.test(mgmt)) fail_("รหัสวิธีการจัดการต้องเป็นตัวเลข 3 หลัก (หรือเว้นว่าง)");
+  if (rows.some(function (r) { return r !== existing && recvKey_(r.name) === recvKey_(name); })) fail_("มีผู้รับดำเนินการชื่อนี้อยู่แล้ว");
+  var active = input.active === undefined ? (existing ? existing.active : 1) : (phpTruthy_(input.active) && str_(input.active) !== "false" ? 1 : 0);
+  var at = nowParts_().datetime;
+  if (existing) {
+    var typesOf = table_("waste_types").rows.filter(function (t) { return recvKey_(t.receiver) === recvKey_(existing.name); });
+    if (active === 0 && typesOf.some(function (t) { return t.active === 1; })) {
+      fail_("ผู้รับนี้ยังมีประเภทของเสียที่เปิดใช้งานอยู่ — ปิดใช้งานประเภทเหล่านั้นก่อน");
+    }
+    var before = existing.name + (existing.reg ? " (" + existing.reg + ")" : "") + " · " + (existing.active ? "ใช้งาน" : "ปิดใช้งาน");
+    update_("receivers", existing, { name: name, reg: reg, mgmt_code: mgmt, active: active, updated_at: at, updated_by: REQ_.actor });
+    typesOf.forEach(function (t) {
+      if (t.receiver !== name || t.receiver_reg !== reg) update_("waste_types", t, { receiver: name, receiver_reg: reg, updated_at: at, updated_by: REQ_.actor });
+    });
+    audit_("setting", "receiver_save", "แก้ไขผู้รับดำเนินการ #" + existing.id + " — เดิม: " + before + " → ใหม่: " + name +
+      (reg ? " (" + reg + ")" : "") + " · " + (active ? "ใช้งาน" : "ปิดใช้งาน") + " · " + typesOf.length + " ประเภท", "R" + existing.id);
+    return { id: existing.id, created: false, message: "บันทึกผู้รับดำเนินการ " + name + " แล้ว" };
+  }
+  var maxSort = 0;
+  rows.forEach(function (r) { if (r.sort > maxSort) maxSort = r.sort; });
+  var row = insert_("receivers", { name: name, reg: reg, mgmt_code: mgmt, active: active, sort: maxSort + 1, updated_at: at, updated_by: REQ_.actor });
+  audit_("setting", "receiver_save", "เพิ่มผู้รับดำเนินการ #" + row.id + ": " + name + (reg ? " (" + reg + ")" : ""), "R" + row.id);
+  return { id: row.id, created: true, message: "เพิ่มผู้รับดำเนินการ " + name + " แล้ว" };
+}
+
+// Only a receiver without any waste type can be removed (a type that has
+// movements stays, so its receiver is deactivated instead).
+function actionReceiverDelete_(input) {
+  ensureReceivers_();
+  var id = phpInt_(input.id);
+  var r = table_("receivers").rows.filter(function (x) { return x.id === id; })[0];
+  if (!r) fail_("ไม่พบผู้รับดำเนินการนี้");
+  if (table_("waste_types").rows.some(function (t) { return recvKey_(t.receiver) === recvKey_(r.name); })) {
+    fail_("ผู้รับนี้ยังมีประเภทของเสียอยู่ ลบไม่ได้ — ให้ปิดใช้งานแทน");
+  }
+  delete_("receivers", r);
+  audit_("setting", "receiver_delete", "ลบผู้รับดำเนินการ #" + r.id + ": " + r.name, "R" + r.id);
+  return { id: r.id, message: "ลบผู้รับดำเนินการ " + r.name + " แล้ว" };
 }
 
 /* ===================== business helpers ===================== */
@@ -1202,7 +1364,7 @@ function tonsToKg_(v) {
   return Math.round(t * 100000) / 100;
 }
 
-// kg -> tons text: thousands separators, 3 decimals (more only when the kg
+// kg -> tons text: thousands separators, 2 decimals (more only when the kg
 // amount has a fraction, e.g. older rows: 1234.56 kg -> "1.23456").
 function tonsText_(kg, sep) {
   var c = Math.round(Number(kg || 0) * 100);
@@ -1212,7 +1374,7 @@ function tonsText_(kg, sep) {
   var frac = String(c % 100000);
   while (frac.length < 5) frac = "0" + frac;
   frac = frac.replace(/0+$/, "");
-  while (frac.length < 3) frac += "0";
+  while (frac.length < 2) frac += "0";
   if (sep) whole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return (neg ? "-" : "") + whole + "." + frac;
 }
@@ -1714,6 +1876,8 @@ function setupSystem() {
       seeded++;
     });
   }
+  REQ_.actor = "setupSystem";
+  ensureReceivers_();
   flush_();
   REQ_ = null;
 

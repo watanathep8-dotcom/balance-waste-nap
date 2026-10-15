@@ -2,7 +2,7 @@
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const view = $('#view');
-const S = { types: [], balance: {}, containers: {}, company: {}, limits: {}, charts: [] };
+const S = { types: [], receivers: [], balance: {}, containers: {}, company: {}, limits: {}, charts: [] };
 const store = (fn, k, v) => { try { return fn === 'get' ? localStorage.getItem(k) : fn === 'del' ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { return null; } };
 /* ผู้ใช้งาน: ชื่อที่ตั้งไว้มุมขวาบน (เก็บในเบราว์เซอร์นี้) — ส่งไปกับทุกการบันทึก เป็น “ผู้บันทึก” ในประวัติ / Log */
 S.user = store('get', 'wasteUser') || '';
@@ -29,7 +29,7 @@ const PAGES = {
   balance: ['คงเหลือ & โควตา', 'ยอดคงเหลือในโรงงาน ภาชนะ และการใช้โควตาปีนี้'],
   history: ['ประวัติรายการ', 'ทุกรายการจัดเก็บ / ส่งกำจัด · ค้นหา · ส่งออก Excel'],
   logs: ['บันทึกประวัติ (Log)', 'ทุกการกระทำในระบบ — ใคร ทำอะไร เมื่อไร'],
-  settings: ['ตั้งค่าประเภทของเสีย', 'รหัสของเสีย ปริมาณที่ได้รับอนุญาต ผู้รับดำเนินการ'],
+  settings: ['ตั้งค่าประเภทของเสีย', 'ประเภทของเสีย ปริมาณที่ได้รับอนุญาต (ตัน) และผู้รับดำเนินการ'],
 };
 
 /* ---------- API (Google Apps Script web app) ---------- */
@@ -86,7 +86,7 @@ const CLIENT_ID = (() => {
 const treatOn = () => can('viewer') && currentPage() === 'treat';
 
 // Actions that change data: the user's name (top-right) must be set first.
-const NAME_REQUIRED = ['store', 'ship', 'opening', 'treat', 'movement_update', 'movement_delete', 'type_save', 'reset_data'];
+const NAME_REQUIRED = ['store', 'ship', 'opening', 'treat', 'movement_update', 'movement_delete', 'type_save', 'receiver_save', 'receiver_delete', 'type_delete', 'reset_data'];
 async function gasPost(payload) {
   if (!API_URL) throw new Error(NO_API_MSG);
   if (NAME_REQUIRED.includes(payload.action) && !S.user) {
@@ -214,7 +214,7 @@ async function downloadCsv(action, params) {
 if (!API_URL) $('#cfgBanner').hidden = false;
 // false: the session of this tab has ended on the server (the page is drawn again, locked)
 function applyBoot(j) {
-  Object.assign(S, { types: j.types, balance: j.balance, containers: j.containers || {}, company: j.company || {}, limits: j.limits || {}, now: j.now });
+  Object.assign(S, { types: j.types, receivers: j.receivers || [], balance: j.balance, containers: j.containers || {}, company: j.company || {}, limits: j.limits || {}, now: j.now });
   // the server is the authority on the level of this session (null: no / expired session)
   if (S.sess && j.role === null) {
     const p = currentPage();
@@ -270,13 +270,13 @@ const fmtFix = (n, d = 0) => Number(n || 0).toLocaleString('th-TH', { minimumFra
 /* หน่วยแสดงผล = ตัน (ชีตเก็บเป็น กก.) — แสดงทศนิยม 2 ตำแหน่ง (ยอดจริงในชีตยังเก็บละเอียดถึง กก.) */
 const fmtT = kg => (Number(kg || 0) / 1000).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtKgHint = kg => Number(kg || 0).toLocaleString('th-TH', { maximumFractionDigits: 2 });
-// kg -> exact ton text for an input (no separators), e.g. 1234.56 -> "1.23456", 125 -> "0.125"
+// kg -> exact ton text for an input (no separators, 2+ decimals), e.g. 1234.56 -> "1.23456", 100 -> "0.10", 1000 -> "1.00"
 const tonsStr = kg => {
   const c = Math.round(Math.abs(Number(kg || 0)) * 100);
   const f = String(c % 100000).padStart(5, '0').replace(/0+$/, '');
-  return Math.floor(c / 100000) + (f ? '.' + f.padEnd(3, '0') : '');
+  return Math.floor(c / 100000) + '.' + f.padEnd(2, '0'); // at least 2 decimals (more only for a fraction of a kg)
 };
-// Weight typed in tons: up to 5 decimals (0.01 kg; normally 3 = 1 kg), returns kg or NaN.
+// Weight typed in tons (the page shows 2 decimals; up to 5 are still read for older kg data), returns kg or NaN.
 const parseT = v => { const s = String(v ?? '').replace(/,/g, '').trim(); return /^\d+(\.\d{1,5})?$/.test(s) ? Math.round(Number(s) * 100000) / 100 : NaN; };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const typeById = id => S.types.find(t => +t.id === +id);
@@ -284,7 +284,11 @@ const balOf = id => S.balance[id] || { balance_kg: 0, containers: { drum200: 0, 
 const dtTH = s => { const d = new Date(s.slice(0, 10) + 'T00:00:00'); return d.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: '2-digit' }) + ' ' + s.slice(11, 16) + ' น.'; };
 const dateTH = s => new Date(s.slice(0, 10) + 'T00:00:00').toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' });
 const nowParts = () => { const d = new Date(); const p = n => String(n).padStart(2, '0'); return { date: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`, time: `${p(d.getHours())}:${p(d.getMinutes())}` }; };
-const receivers = () => [...new Set(S.types.map(t => t.receiver))];
+// receivers that have waste types, in the order of the settings list (forms, filters, balance page)
+const receivers = () => {
+  const names = [...new Set(S.types.map(t => t.receiver))], pos = n => { const i = (S.receivers || []).findIndex(r => r.name === n); return i < 0 ? 9999 : i; };
+  return names.sort((a, b) => pos(a) - pos(b));
+};
 const shortRecv = r => String(r || '').replace(/^(บจก\.|บมจ\.|บริษัท)\s*/, '').replace('บริหารและพัฒนาเพื่อการอนุรักษ์สิ่งแวดล้อม', 'บริหารและพัฒนาฯ (GENCO)');
 const typeLabel = t => t ? `${t.code} · ${t.name}` : '—';
 const lvName = { ok: 'ปกติ', warn: 'ใกล้เต็มโควตา', over: 'เกินโควตา' };
@@ -723,7 +727,7 @@ function drawDashCharts(d) {
       ] },
       options: { responsive: true, maintainAspectRatio: false, animation: { duration: reduceMotion() ? 0 : 1200, easing: 'easeOutQuart' },
         plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'circle' } }, tooltip: { callbacks: { label: c => `${c.dataset.label}: ${fmtFix(c.parsed.y, 2)}` } } },
-        scales: { x: { grid: { display: false } }, y: { beginAtZero: true, grid: { color: 'rgba(6,78,59,.06)' }, ticks: { callback: v => fmt(v, 2) } } } },
+        scales: { x: { grid: { display: false } }, y: { beginAtZero: true, grid: { color: 'rgba(6,78,59,.06)' }, ticks: { callback: v => fmtFix(v, 2) } } } },
     }));
   }
   const cc = $('#cCont');
@@ -777,7 +781,7 @@ function txForm(page) {
       <div class="card"><div class="step-h"><span class="n">2</span><h3>น้ำหนัก &amp; ภาชนะบรรจุ</h3></div>
         <div id="liveBal"></div>
         <div class="field"><label>น้ำหนัก (ตัน) · ทศนิยม 2 ตำแหน่ง เช่น 0.25 ตัน = 250 กก.</label>
-          <div class="weight-box" id="wBox"><input id="fW" inputmode="decimal" autocomplete="off" placeholder="0.000"><span>ตัน</span></div>
+          <div class="weight-box" id="wBox"><input id="fW" inputmode="decimal" autocomplete="off" placeholder="0.00"><span>ตัน</span></div>
           <div class="weight-help" id="wHelp">&nbsp;</div>
           <div class="quick" id="wQuick">${QUICK_T.map(v => `<button type="button" data-add="${v}">+${v}</button>`).join('')}<button type="button" data-add="0">ล้าง</button>${out ? '<button type="button" data-all="1">ทั้งหมดที่คงเหลือ</button>' : ''}</div></div>
         <div class="field mt"><label>ภาชนะบรรจุ</label><div class="ccards" id="cCards"></div></div>
@@ -836,7 +840,7 @@ function txForm(page) {
     const ok = !Object.keys(e).length;
     $('#sumBox').innerHTML = `${treat ? '<div class="treat-ic sum-ic" aria-hidden="true"><span class="tr"></span><span class="tc"><i class="fa-solid fa-flask-vial"></i></span></div>' : ecoLogo('sum-ic')}
       <h3 style="justify-content:center"><i class="fa-solid ${k.icon}" style="color:${k.c}"></i>${k.name}</h3>
-      <div class="sum-total"><b>${isNaN(w) ? '0.000' : fmtT(w)} <small style="font-size:16px">ตัน</small></b><small>${isNaN(w) ? '' : '= ' + fmtKgHint(w) + ' กก.'}</small></div>
+      <div class="sum-total"><b>${isNaN(w) ? '0.00' : fmtT(w)} <small style="font-size:16px">ตัน</small></b><small>${isNaN(w) ? '' : '= ' + fmtKgHint(w) + ' กก.'}</small></div>
       <div class="sum-list">
         <div><span>ของเสีย</span><b>${t ? esc(t.name) : '—'}</b></div>
         <div><span>รหัสของเสีย</span><b>${t ? esc(t.code) + ' · จัดการ ' + esc(t.mgmt_code) : '—'}</b></div>
@@ -1152,7 +1156,7 @@ async function deleteMovement(m) {
 
 /* ================= LOGS ================= */
 const LOGCAT = { waste: ['ของเสีย', 'fa-recycle', '#059669'], edit: ['แก้ไข / ลบ', 'fa-pen-to-square', '#8B5CF6'], setting: ['ตั้งค่า', 'fa-gear', '#0F2A23'], warn: ['ถูกปฏิเสธ', 'fa-ban', '#F59E0B'] };
-const LOGACT = { store: 'fa-box-archive', ship: 'fa-truck-arrow-right', opening: 'fa-flag-checkered', treat: 'fa-flask-vial', treat_unlock: 'fa-lock-open' /* older rows */, movement_update: 'fa-pen-to-square', movement_delete: 'fa-trash-can', type_save: 'fa-gear', reset_data: 'fa-broom' };
+const LOGACT = { store: 'fa-box-archive', ship: 'fa-truck-arrow-right', opening: 'fa-flag-checkered', treat: 'fa-flask-vial', treat_unlock: 'fa-lock-open' /* older rows */, movement_update: 'fa-pen-to-square', movement_delete: 'fa-trash-can', type_save: 'fa-gear', receiver_save: 'fa-truck-field', receiver_delete: 'fa-trash-can', type_delete: 'fa-trash-can', reset_data: 'fa-broom' };
 async function logs() {
   const n = nowParts();
   let cat = '', items = null, loadedWith = '';
@@ -1208,34 +1212,86 @@ async function logs() {
   load();
 }
 
-/* ================= SETTINGS (waste types) ================= */
+/* ================= SETTINGS (waste types + receivers) ================= */
 const ICONS = ['fa-recycle', 'fa-box-open', 'fa-bottle-water', 'fa-gears', 'fa-spray-can', 'fa-fill-drip', 'fa-biohazard', 'fa-lightbulb', 'fa-microchip', 'fa-jug-detergent', 'fa-note-sticky', 'fa-water', 'fa-faucet-drip', 'fa-oil-can', 'fa-flask', 'fa-battery-half', 'fa-dumpster', 'fa-trash-can', 'fa-leaf', 'fa-skull-crossbones', 'fa-fire', 'fa-droplet', 'fa-box'];
 const COLORS = ['#059669', '#14B8A6', '#0EA5E9', '#6366F1', '#A855F7', '#EC4899', '#EF4444', '#F97316', '#F59E0B', '#EAB308', '#B7791F', '#8B5E3C', '#64748B', '#0F2A23'];
 function settings() {
-  view.innerHTML = `<div class="reset-topbar"><button class="btn btn-primary" id="tAdd"><i class="fa-solid fa-plus"></i>เพิ่มประเภทของเสีย</button><button class="btn btn-bad" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button></div>
-    <div class="card"><h3><i class="fa-solid fa-list-check"></i>ประเภทของเสียตามหนังสืออนุญาต<span class="sub">${S.types.length} รายการ · อนุญาตรวม ${fmt(S.types.filter(t => +t.active === 1).reduce((a, t) => a + Number(t.permit_tons), 0), 2)} ตัน</span></h3>
+  const rs = S.receivers || [];
+  const activeTypes = S.types.filter(t => +t.active === 1);
+  const permitTotal = activeTypes.reduce((a, t) => a + Math.round(Number(t.permit_tons) * 100), 0) / 100;
+  view.innerHTML = `<div class="reset-topbar"><button class="btn btn-primary" id="tAdd"><i class="fa-solid fa-plus"></i>เพิ่มประเภทของเสีย</button><button class="btn btn-primary" id="rAdd"><i class="fa-solid fa-truck-field"></i>เพิ่มผู้รับดำเนินการ</button><button class="btn btn-bad" id="resetBtn">🗑 รีเซ็ตข้อมูล / Reset data</button></div>
+    <div class="card"><h3><i class="fa-solid fa-truck-field"></i>ผู้รับดำเนินการ<span class="sub">${rs.length} ราย · โควตารวมของประเภทที่ใช้งาน ${fmtFix(permitTotal, 2)} ตัน</span></h3>
+      <p class="hint"><i class="fa-solid fa-circle-info"></i> ผู้รับและประเภทของเสียที่เพิ่มไว้ จะขึ้นในหน้าภาพรวม (โควตาตามผู้รับ / แยกประเภท) ฟอร์มบันทึก-ส่งกำจัด ยอดคงเหลือ ประวัติ และไฟล์ CSV อัตโนมัติ · ผู้รับที่ยังไม่มีประเภทจะมีโควตา 0 ตัน</p>
+      <div class="tlist stagger" id="rList">${rs.map(r => `<div class="titem ${+r.active === 1 ? '' : 'off'}" style="--c:var(--brand)"><span class="ti"><i class="fa-solid fa-truck-field"></i></span>
+        <div class="tx"><b>${esc(r.name)} ${+r.active === 1 ? '' : '<span class="tag off">ปิดใช้งาน</span>'}</b><small>${r.reg ? 'ทะเบียน ' + esc(r.reg) + ' · ' : ''}${r.mgmt_code ? 'รหัสจัดการ ' + esc(r.mgmt_code) + ' · ' : ''}${fmt(r.types)} ประเภท · โควตา ${fmtFix(r.permit_tons, 2)} ตัน</small></div>
+        <button class="btn btn-sm btn-ghost" data-redit="${r.id}" data-rname="${esc(r.name)}"><i class="fa-solid fa-pen"></i>แก้ไข</button>
+        ${r.types ? '' : `<button class="btn btn-sm btn-ghost" data-rdel="${r.id}" data-rname="${esc(r.name)}" title="ลบ (ใช้ได้เมื่อไม่มีประเภทของเสีย)"><i class="fa-solid fa-trash-can"></i></button>`}</div>`).join('') || '<div class="empty">ยังไม่มีผู้รับดำเนินการ</div>'}</div></div>
+    <div class="card mt"><h3><i class="fa-solid fa-list-check"></i>ประเภทของเสียตามหนังสืออนุญาต<span class="sub">${S.types.length} รายการ · อนุญาตรวม ${fmtFix(permitTotal, 2)} ตัน</span></h3>
       <div class="tlist stagger">${S.types.map(t => `<div class="titem ${+t.active === 1 ? '' : 'off'}" style="--c:${esc(t.color)}"><span class="ti"><i class="fa-solid ${esc(t.icon)}"></i></span>
-        <div class="tx"><b>${esc(t.code)} · ${esc(t.name)} ${+t.active === 1 ? '' : '<span class="tag off">ปิดใช้งาน</span>'}</b><small>อนุญาต ${fmt(t.permit_tons, 2)} ตัน · รหัสจัดการ ${esc(t.mgmt_code)} · ${esc(t.receiver)}${t.receiver_reg ? ' (ทะเบียน ' + esc(t.receiver_reg) + ')' : ''}</small></div>
-        <button class="btn btn-sm btn-ghost" data-tedit="${t.id}"><i class="fa-solid fa-pen"></i>แก้ไข</button></div>`).join('')}</div></div>`;
-  view.onclick = e => { const b = e.target.closest('[data-tedit]'); if (b) typeForm(typeById(b.dataset.tedit)); };
+        <div class="tx"><b>${esc(t.code)} · ${esc(t.name)} ${+t.active === 1 ? '' : '<span class="tag off">ปิดใช้งาน</span>'}</b><small>อนุญาต ${fmtFix(t.permit_tons, 2)} ตัน · รหัสจัดการ ${esc(t.mgmt_code)} · ${esc(t.receiver)}${t.receiver_reg ? ' (ทะเบียน ' + esc(t.receiver_reg) + ')' : ''}${t.has_moves ? ' · มีรายการแล้ว' : ''}</small></div>
+        <button class="btn btn-sm btn-ghost" data-tedit="${t.id}"><i class="fa-solid fa-pen"></i>แก้ไข</button>
+        ${t.has_moves ? '' : `<button class="btn btn-sm btn-ghost" data-tdel="${t.id}" title="ลบ (ใช้ได้เมื่อยังไม่มีรายการ)"><i class="fa-solid fa-trash-can"></i></button>`}</div>`).join('')}</div></div>`;
+  view.onclick = e => {
+    const b = e.target.closest('[data-tedit],[data-redit],[data-rdel],[data-tdel]');
+    if (!b) return;
+    if (b.dataset.tedit) typeForm(typeById(b.dataset.tedit));
+    else if (b.dataset.redit !== undefined) receiverForm(rs.find(r => r.name === b.dataset.rname));
+    else if (b.dataset.rdel) confirmDelete('ลบผู้รับดำเนินการ “' + b.dataset.rname + '”?', 'receiver_delete', { id: b.dataset.rdel });
+    else if (b.dataset.tdel) { const t = typeById(b.dataset.tdel); confirmDelete('ลบประเภทของเสีย ' + t.code + ' ' + t.name + '?', 'type_delete', { id: t.id }); }
+  };
   $('#tAdd').onclick = () => typeForm(null);
+  $('#rAdd').onclick = () => receiverForm(null);
   $('#resetBtn').onclick = resetData;
+}
+async function confirmDelete(msg, action, body) {
+  if (!confirm(msg + '\n\n(ลบได้เฉพาะรายการที่ยังไม่ถูกใช้ — ถ้ามีรายการเคลื่อนไหวแล้วให้ปิดใช้งานแทน)')) return;
+  try { const r = await writeApi(action, body); toast(r.message, 'ok'); route(); } catch (e) { toast(e.message, 'err'); }
+}
+// permit tons are typed with 2 decimals (older values with more are shown as they are)
+const permitStr = v => { const n = Number(v || 0); return Math.abs(Math.round(n * 100) - n * 100) < 1e-6 ? n.toFixed(2) : String(n); };
+function receiverForm(r) {
+  const m = recordForm(`<h3><i class="fa-solid ${r ? 'fa-pen-to-square' : 'fa-truck-field'}" style="color:var(--brand)"></i> ${r ? 'แก้ไขผู้รับดำเนินการ' : 'เพิ่มผู้รับดำเนินการ'}</h3>
+    <div class="fields mt">
+      <div class="field full"><label>ชื่อผู้รับดำเนินการ</label><input id="rName" maxlength="120" value="${esc(r?.name || '')}"></div>
+      <div class="field"><label>เลขทะเบียนผู้รับ</label><input id="rReg" inputmode="numeric" maxlength="20" value="${esc(r?.reg || '')}"></div>
+      <div class="field"><label>รหัสวิธีการจัดการ (3 หลัก · ไม่บังคับ)</label><input id="rMg" inputmode="numeric" maxlength="3" value="${esc(r?.mgmt_code || '')}"></div>
+      <div class="field full"><label class="switch"><input type="checkbox" id="rAct" ${!r || +r.active === 1 ? 'checked' : ''}> ใช้งาน</label></div>
+      ${r ? '<p class="hint full"><i class="fa-solid fa-circle-info"></i> การแก้ชื่อ / เลขทะเบียน จะเปลี่ยนในทุกประเภทของเสียของผู้รับนี้ · ปิดใช้งานได้เมื่อปิดประเภทของเสียทั้งหมดของผู้รับแล้ว</p>' : ''}
+    </div>`, f => writeApi('receiver_save', { id: r?.id || '', current_name: r && !r.id ? r.name : '', name: $('#rName', f).value, reg: $('#rReg', f).value, mgmt_code: $('#rMg', f).value, active: $('#rAct', f).checked ? 1 : 0 }));
+  return m;
 }
 function typeForm(t) {
   let ic = t?.icon || ICONS[0], col = t?.color || COLORS[0];
-  const recvList = receivers();
+  const rs = (S.receivers || []).filter(r => +r.active === 1 || r.name === t?.receiver);
+  const NEW = '__new';
+  const cur = t ? (rs.find(r => r.name === t.receiver)?.name ?? '') : (rs[0]?.name ?? NEW);
   const m = recordForm(`<h3><i class="fa-solid ${t ? 'fa-pen-to-square' : 'fa-plus'}" style="color:var(--brand)"></i> ${t ? 'แก้ไขประเภทของเสีย' : 'เพิ่มประเภทของเสีย'}</h3>
     <div class="fields mt">
       <div class="field"><label>รหัสของเสีย (6 หลัก)</label><input id="tCode" inputmode="numeric" maxlength="6" value="${esc(t?.code || '')}"></div>
       <div class="field"><label>รหัสวิธีการจัดการ (3 หลัก)</label><input id="tMg" inputmode="numeric" maxlength="3" value="${esc(t?.mgmt_code || '')}"></div>
       <div class="field full"><label>ชื่อของเสีย</label><input id="tName" maxlength="120" value="${esc(t?.name || '')}"></div>
-      <div class="field"><label>ปริมาณที่ได้รับอนุญาต (ตัน/ปี)</label><input id="tTons" inputmode="decimal" value="${t ? +t.permit_tons : ''}"></div>
-      <div class="field"><label>เลขทะเบียนผู้รับ</label><input id="tReg" inputmode="numeric" maxlength="20" value="${esc(t?.receiver_reg || '')}"></div>
-      <div class="field full"><label>ผู้รับดำเนินการ</label><input id="tRecv" list="recvList" maxlength="120" value="${esc(t?.receiver || '')}"><datalist id="recvList">${recvList.map(r => `<option value="${esc(r)}">`).join('')}</datalist></div>
+      <div class="field"><label>ปริมาณที่ได้รับอนุญาต (ตัน/ปี) · ทศนิยม 2 ตำแหน่ง</label><input id="tTons" inputmode="decimal" placeholder="0.00" value="${t ? permitStr(t.permit_tons) : ''}"></div>
+      <div class="field"><label>ผู้รับดำเนินการ</label><select id="tRecv">${rs.map(r => `<option value="${esc(r.name)}" ${r.name === cur ? 'selected' : ''}>${esc(r.name)}${r.reg ? ' (' + esc(r.reg) + ')' : ''}</option>`).join('')}<option value="${NEW}" ${cur === NEW ? 'selected' : ''}>+ เพิ่มผู้รับรายใหม่…</option></select></div>
+      <div class="field full" id="tNewBox" ${cur === NEW ? '' : 'hidden'}><label>ผู้รับรายใหม่ — ชื่อ และเลขทะเบียน</label>
+        <div class="fields"><div class="field"><input id="tNewName" maxlength="120" placeholder="ชื่อผู้รับดำเนินการ"></div><div class="field"><input id="tNewReg" inputmode="numeric" maxlength="20" placeholder="เลขทะเบียนผู้รับ"></div></div></div>
       <div class="field full"><label>ไอคอน</label><div class="icon-pick">${ICONS.map(i => `<button type="button" data-ic="${i}" class="${i === ic ? 'sel' : ''}"><i class="fa-solid ${i}"></i></button>`).join('')}</div></div>
       <div class="field full"><label>สี</label><div class="color-pick">${COLORS.map(c => `<button type="button" data-col="${c}" style="--c:${c}" class="${c.toUpperCase() === col.toUpperCase() ? 'sel' : ''}"></button>`).join('')}</div></div>
-      <div class="field full"><label class="switch"><input type="checkbox" id="tAct" ${!t || +t.active === 1 ? 'checked' : ''}> ใช้งาน (แสดงในหน้าบันทึกจัดเก็บ)</label></div>
-    </div>`, f => writeApi('type_save', { id: t?.id || '', code: $('#tCode', f).value, mgmt_code: $('#tMg', f).value, name: $('#tName', f).value, permit_tons: $('#tTons', f).value, receiver_reg: $('#tReg', f).value, receiver: $('#tRecv', f).value, icon: ic, color: col, active: $('#tAct', f).checked ? 1 : 0 }));
+      <div class="field full"><label class="switch"><input type="checkbox" id="tAct" ${!t || +t.active === 1 ? 'checked' : ''}> ใช้งาน (แสดงในหน้าบันทึกจัดเก็บ และนับโควตาของผู้รับ)</label></div>
+    </div>`, f => {
+    const tons = $('#tTons', f).value.replace(/,/g, '').trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(tons)) return Promise.reject(new Error('ปริมาณที่ได้รับอนุญาต (ตัน) ต้องเป็นตัวเลข ทศนิยมไม่เกิน 2 ตำแหน่ง เช่น 12.50'));
+    const sel = $('#tRecv', f).value, isNew = sel === NEW;
+    const rc = isNew ? null : (S.receivers || []).find(r => r.name === sel);
+    return writeApi('type_save', { id: t?.id || '', code: $('#tCode', f).value, mgmt_code: $('#tMg', f).value, name: $('#tName', f).value, permit_tons: tons,
+      ...(isNew ? { receiver: $('#tNewName', f).value, receiver_reg: $('#tNewReg', f).value } : rc?.id ? { receiver_id: rc.id } : { receiver: sel, receiver_reg: rc?.reg || '' }),
+      icon: ic, color: col, active: $('#tAct', f).checked ? 1 : 0 });
+  });
+  const sel = $('#tRecv', m);
+  sel.onchange = () => {
+    $('#tNewBox', m).hidden = sel.value !== NEW;
+    const rc = (S.receivers || []).find(r => r.name === sel.value);
+    if (rc?.mgmt_code && !$('#tMg', m).value) $('#tMg', m).value = rc.mgmt_code;
+  };
   m.addEventListener('click', e => {
     const i = e.target.closest('[data-ic]'), c = e.target.closest('[data-col]');
     if (i) { ic = i.dataset.ic; $$('[data-ic]', m).forEach(x => x.classList.toggle('sel', x === i)); }

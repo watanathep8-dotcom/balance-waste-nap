@@ -244,7 +244,7 @@ const ACTOR = "Tester";
 const READS = ["bootstrap", "dashboard", "history", "export", "batch"];
 const PUBLIC_WRITES = ["store", "ship", "opening"];
 const STAFF_ONLY = ["treat"];
-const ADMIN_ONLY = ["movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export"];
+const ADMIN_ONLY = ["movement_update", "movement_delete", "type_save", "receiver_save", "receiver_delete", "type_delete", "reset_data", "logs", "logs_export"];
 const PUBLIC_ACTIONS = READS.concat(PUBLIC_WRITES);
 const ALL_ACTIONS = PUBLIC_ACTIONS.concat(STAFF_ONLY, ADMIN_ONLY);
 const getRaw = (params = {}) => {
@@ -312,7 +312,7 @@ test("API before setup: reads and writes report the setupSystem error (after a v
   delete state.props.WASTE_VIEW_PASSWORD; delete state.props.WASTE_STAFF_PASSWORD; delete state.props.WASTE_RESET_PASSWORD;
 });
 
-test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permitted waste types", () => {
+test("setupSystem creates spreadsheet, 4 sheets, headers and seeds the 13 permitted waste types", () => {
   const r = ctx.setupSystem();
   assert.strictEqual(r.created, true);
   assert.strictEqual(r.seededTypes, 13);
@@ -322,7 +322,9 @@ test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permit
   const ss = state.spreadsheets[state.props.WASTE_SPREADSHEET_ID];
   assert.strictEqual(ss.tz, "Asia/Bangkok");
   assert.strictEqual(ss.name, "Balance Waste Database");
-  assert.deepStrictEqual(ss.getSheets().map(s => s.getName()), ["waste_types", "movements", "audit_logs"]);
+  assert.deepStrictEqual(ss.getSheets().map(s => s.getName()), ["waste_types", "receivers", "movements", "audit_logs"]);
+  assert.deepStrictEqual(sheet("receivers").data[0], ["id", "name", "reg", "mgmt_code", "active", "sort", "updated_at", "updated_by"]);
+  assert.strictEqual(dataRows("receivers"), 3);
   assert.deepStrictEqual(sheet("waste_types").data[0], ["id", "code", "name", "permit_tons", "mgmt_code", "receiver_reg", "receiver", "icon", "color", "active", "sort", "updated_at", "updated_by"]);
   assert.deepStrictEqual(sheet("movements").data[0], ["id", "doc_no", "kind", "type_id", "weight_kg", "container", "containers", "location", "manifest_no", "vehicle", "note", "moved_at", "created_at", "actor", "updated_at", "updated_by", "method"]);
   assert.strictEqual(dataRows("waste_types"), 13);
@@ -417,7 +419,7 @@ test("store: field validation (type, weight, decimals, container, count, date, t
   err(mvT("store", 1, "0.000001"), /ทศนิยมได้ไม่เกิน 5/); // finer than 0.01 kg
   err(mvT("store", 1, 0.0000015), /ทศนิยมได้ไม่เกิน 5|ตัวเลข/);
   err(mvT("store", 1, [5]), /กรอกน้ำหนัก/);
-  err(mvT("store", 1, "1000.001"), /ไม่เกิน 1,000\.000 ตัน/);
+  err(mvT("store", 1, "1000.001"), /ไม่เกิน 1,000.00 ตัน/);
   // the old kg field is not a weight any more (the page sends tons)
   err(post("store", Object.assign({ type_id: 1, weight_kg: 5, container: "drum200", containers: 1 }, at(5))), /กรอกน้ำหนัก/);
   err(mv("store", 1, 10, { container: "box" }), /ภาชนะ/);
@@ -504,8 +506,8 @@ test("units: weight_t (tons) -> kg in the sheet exactly (0.001 t = 1 kg, finest 
   // the text forms: thousands separators, 3 decimals, more only for a fraction of a kg
   assert.strictEqual(E.c.fmtT_(1234567.89), "1,234.56789");
   assert.strictEqual(E.c.fmtT_(125), "0.125");
-  assert.strictEqual(E.c.fmtT_(0), "0.000");
-  assert.strictEqual(E.c.fmtT_(1000000), "1,000.000");
+  assert.strictEqual(E.c.fmtT_(0), "0.00");
+  assert.strictEqual(E.c.fmtT_(1000000), "1,000.00");
   assert.strictEqual(E.c.fmtT_(-5), "-0.005");
   assert.strictEqual(E.c.fmtT_(0.01), "0.00001");
   assert.strictEqual(E.c.tonsText_(1234567.8, false), "1234.5678");
@@ -558,10 +560,10 @@ test("ship: cannot exceed the current balance or containers; exact remaining amo
   const before = dataRows("movements");
   const r = err(mv("ship", 3, "100.01", { container: "bigbag", containers: 1, ...at(2) }), /ส่งกำจัดเกินยอดคงเหลือ/);
   assert.strictEqual(r.code, "NEGATIVE_BALANCE");
-  assert.ok(/มี 0\.100 ตัน แต่ต้องนำออก 0\.10001 ตัน/.test(r.error), r.error);
+  assert.ok(/มี 0.10 ตัน แต่ต้องนำออก 0\.10001 ตัน/.test(r.error), r.error);
   err(mv("ship", 3, 50, { container: "bigbag", containers: 3, ...at(2) }), /Bigbag.*มี 2 ภาชนะ แต่ต้องนำออก 3/);
   err(mv("ship", 3, 50, { container: "drum200", containers: 1, ...at(2) }), /ถัง 200 ลิตร/);
-  err(mv("ship", 4, 1, { ...at(2) }), /มี 0\.000 ตัน/);
+  err(mv("ship", 4, 1, { ...at(2) }), /มี 0.00 ตัน/);
   assert.strictEqual(dataRows("movements"), before);
   const s = okData(mv("ship", 3, 100, { container: "bigbag", containers: 2, manifest_no: "MN-1", vehicle: "70-1234", ...at(2) }));
   assert.strictEqual(s.doc_no, "SH-" + YMD + "-0002"); // SH-0001 used by the balance-math test
@@ -729,7 +731,7 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   assert.strictEqual(r.doc_no, "TR-" + YMD + "-0001");
   assert.strictEqual(r.kind, "treat");
   assert.strictEqual(r.balance_kg, 50);
-  assert.ok(/^ข้อมูลภายใน .* 0\.150 ตัน เรียบร้อย/.test(r.message), r.message);
+  assert.ok(/^ข้อมูลภายใน .* 0.15 ตัน เรียบร้อย/.test(r.message), r.message);
   const row = sheet("movements").data.find(x => x[1] === r.doc_no);
   assert.strictEqual(row[2], "treat");
   assert.strictEqual(row[13], ACTOR, "recorded under the name set on the page");
@@ -775,7 +777,7 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   const l = logs()[0];
   assert.strictEqual(l.action, "treat");
   assert.strictEqual(l.ref, r.doc_no);
-  assert.ok(l.detail.startsWith("ข้อมูลภายใน ") && l.detail.includes("0.150 ตัน") && l.detail.includes("ระบบ / วิธีการ: ระบบบำบัดน้ำเสียภายในโรงงาน") && l.actor === ACTOR, l.detail);
+  assert.ok(l.detail.startsWith("ข้อมูลภายใน ") && l.detail.includes("0.15 ตัน") && l.detail.includes("ระบบ / วิธีการ: ระบบบำบัดน้ำเสียภายในโรงงาน") && l.actor === ACTOR, l.detail);
 });
 
 test("treat: cannot exceed the balance or containers (chronological replay); without access the error never names the in-house row", () => {
@@ -784,7 +786,7 @@ test("treat: cannot exceed the balance or containers (chronological replay); wit
   assert.strictEqual(r.code, "NEGATIVE_BALANCE");
   err(mv("treat", 12, 10, { containers: 2, ...at(2) }), /ถัง 200 ลิตร.*มี 1 ภาชนะ แต่ต้องนำออก 2/);
   err(mv("treat", 12, 10, { container: "ibc", ...at(2) }), /IBC/);
-  err(mv("treat", 4, 1, { ...at(2) }), /มี 0\.000 ตัน/);
+  err(mv("treat", 4, 1, { ...at(2) }), /มี 0.00 ตัน/);
   err(mv("treat", 12, 10, { ...at(7) }), /ข้อมูลภายในเกินยอดคงเหลือ/); // before the stock existed
   err(mv("treat", 12, 10, { method: "x".repeat(121), ...at(2) }), /ระบบ \/ วิธีการยาวเกิน 120/);
   // a back-dated (public) shipment that would make the later in-house row negative
@@ -843,7 +845,7 @@ test("in-house rows: only with a password (any level); dashboard identical for e
     const lines = c1.trim().split("\n");
     assert.ok(lines[0].includes(",\"น้ำหนัก (ตัน)\",") && lines[0].endsWith(",ผู้บันทึก,\"ระบบ / วิธีการ\""), lines[0]);
     const tr = lines.find(x => x.startsWith(TR1.doc_no));
-    assert.ok(tr && tr.includes(",ข้อมูลภายใน,") && tr.includes(",ภายในโรงงาน,0.150,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
+    assert.ok(tr && tr.includes(",ข้อมูลภายใน,") && tr.includes(",ภายในโรงงาน,0.15,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
     assert.strictEqual(lines.length - 1, tread(tok, "history", { type: "12" }).items.length);
     // hidden on request (the page does this outside the ข้อมูลภายใน page)
     assert.ok(tread(tok, "history", { hideTreat: true }).items.every(m => m.kind !== "treat"));
@@ -880,7 +882,7 @@ test("treat rows: edit / delete by admin like any row (replay checked, audited);
   assert.strictEqual(row[16], "เตาเผาภายในโรงงาน");
   const l = lastLog();
   assert.strictEqual(l.action, "movement_update");
-  assert.ok(l.detail.includes("ระบบบำบัดน้ำเสียภายในโรงงาน") && l.detail.includes("เตาเผาภายในโรงงาน") && l.detail.includes("0.120 ตัน"));
+  assert.ok(l.detail.includes("ระบบบำบัดน้ำเสียภายในโรงงาน") && l.detail.includes("เตาเผาภายในโรงงาน") && l.detail.includes("0.12 ตัน"));
   // a store the in-house row depends on cannot be deleted; the in-house row itself can
   const b6 = bal(6).balance_kg;
   const st = okData(mv("store", 6, 40, { container: "ibc", containers: 1, ...at(9) }));
@@ -1143,7 +1145,7 @@ test("movement_update: edits with replay check; lowering a store that a later sh
   assert.ok(row[14]);
   const l = lastLog();
   assert.strictEqual(l.category, "edit");
-  assert.ok(l.detail.includes("เดิม:") && l.detail.includes("0.100 ตัน") && l.detail.includes("0.1205 ตัน"), l.detail);
+  assert.ok(l.detail.includes("เดิม:") && l.detail.includes("0.10 ตัน") && l.detail.includes("0.1205 ตัน"), l.detail);
   // a ship edited above the stock is refused, within it accepted
   err(post("movement_update", { id: sh.id, weight_t: "0.12051" }), /แก้ไขไม่ได้/);
   okData(post("movement_update", { id: sh.id, weight_t: 0.1205, manifest_no: "MN-77" }));
@@ -1203,6 +1205,148 @@ test("type_save: validation, add, edit, duplicate check, deactivate (no new stor
   assert.ok(/เดิม:.*1\.25 ตัน.*ใช้งาน → ใหม่:.*2 ตัน.*ปิดใช้งาน/.test(logs({ cat: "setting" })[0].detail));
   err(post("type_save", { id: 999, code: "130205", name: "x", permit_tons: 1, mgmt_code: "061", receiver: "r" }), /ไม่พบ/);
   assert.strictEqual(dataRows("waste_types"), 14);
+});
+
+/* ---------- settings: receivers (ผู้รับดำเนินการ) ---------- */
+test("settings: permit tons accept 2 decimals only; a type with a NEW receiver creates it and shows in both dashboard quota sections", () => {
+  err(post("type_save", { code: "130206", name: "สีเก่า", permit_tons: "1.255", mgmt_code: "061", receiver: "บจก. ใหม่" }), /ไม่เกิน 2 ตำแหน่ง/);
+  const r0 = boot().receivers.length;
+  const a = okData(post("type_save", { code: "130206", name: "สีเก่า", permit_tons: "12.5", mgmt_code: "061", receiver: "บจก. ผู้รับใหม่", receiver_reg: "99001" }));
+  assert.strictEqual(a.receiver_created, true);
+  const b = boot();
+  assert.strictEqual(b.receivers.length, r0 + 1);
+  const rc = b.receivers.find(x => x.name === "บจก. ผู้รับใหม่");
+  assert.deepStrictEqual([rc.reg, rc.active, rc.types, rc.active_types, rc.permit_tons], ["99001", 1, 1, 1, 12.5]);
+  const t = b.types.find(x => x.id === a.id);
+  assert.strictEqual(t.receiver, "บจก. ผู้รับใหม่");
+  assert.strictEqual(t.receiver_reg, "99001");
+  assert.strictEqual(t.has_moves, false);
+  // quota ring (per type) and receiver bar (dashboard) pick it up with no other change
+  assert.strictEqual(b.balance[a.id].permit_kg, 12500);
+  const d = okData(get("dashboard"));
+  const bar = d.receivers.find(x => x.receiver === "บจก. ผู้รับใหม่");
+  assert.deepStrictEqual([bar.types, bar.permit_kg, bar.shipped_year_kg, bar.quota_pct, bar.quota_level], [1, 12500, 0, 0, "ok"]);
+  // store + ship: history filter by receiver, CSV, quota %
+  okData(mv("store", a.id, 5000, { ...at(3) }));
+  okData(mv("ship", a.id, 2500, { ...at(2) }));
+  const bar2 = okData(get("dashboard")).receivers.find(x => x.receiver === "บจก. ผู้รับใหม่");
+  assert.deepStrictEqual([bar2.shipped_year_kg, bar2.quota_pct, bar2.balance_kg], [2500, 20, 2500]);
+  assert.strictEqual(okData(get("history", { receiver: "บจก. ผู้รับใหม่" })).items.length, 2);
+  assert.ok(okData(get("export", { receiver: "บจก. ผู้รับใหม่" })).csv.includes("บจก. ผู้รับใหม่"));
+  assert.strictEqual(boot().types.find(x => x.id === a.id).has_moves, true);
+  // the second type of the same receiver by id adds to the receiver's quota
+  const c = okData(post("type_save", { code: "130207", name: "ตัวทำละลาย", permit_tons: "7.25", mgmt_code: "061", receiver_id: rc.id }));
+  assert.strictEqual(c.receiver_created, false);
+  const rc2 = boot().receivers.find(x => x.id === rc.id);
+  assert.deepStrictEqual([rc2.types, rc2.permit_tons], [2, 19.75]);
+  assert.strictEqual(okData(get("dashboard")).receivers.find(x => x.receiver === "บจก. ผู้รับใหม่").permit_kg, 19750);
+  err(post("type_save", { code: "130208", name: "x", permit_tons: 1, mgmt_code: "061", receiver_id: 9999 }), /ไม่พบผู้รับ/);
+});
+
+test("settings: receiver add / edit (name + registration cascade to types) / duplicates / validation", () => {
+  err(post("receiver_save", { name: "", reg: "1" }), /ชื่อผู้รับ/);
+  err(post("receiver_save", { name: "ก", reg: "12a" }), /ทะเบียน/);
+  err(post("receiver_save", { name: "ก", reg: "1", mgmt_code: "12" }), /3 หลัก/);
+  err(post("receiver_save", { name: " บจก.  ผู้รับใหม่ " }), /มีผู้รับดำเนินการชื่อนี้อยู่แล้ว/);
+  const a = okData(post("receiver_save", { name: "หจก. ยังไม่มีประเภท", reg: "5550001", mgmt_code: "061" }));
+  assert.strictEqual(a.created, true);
+  let rc = boot().receivers.find(x => x.id === a.id);
+  assert.deepStrictEqual([rc.types, rc.permit_tons, rc.mgmt_code], [0, 0, "061"]);
+  // a receiver with no types: 0 quota bar on the dashboard
+  const bar = okData(get("dashboard")).receivers.find(x => x.receiver === "หจก. ยังไม่มีประเภท");
+  assert.deepStrictEqual([bar.types, bar.permit_kg, bar.quota_pct, bar.quota_level], [0, 0, null, "ok"]);
+  // its default management code fills a type that leaves the field empty
+  const t = okData(post("type_save", { code: "130209", name: "ทดสอบรหัสจัดการ", permit_tons: 3, mgmt_code: "", receiver_id: a.id }));
+  assert.strictEqual(boot().types.find(x => x.id === t.id).mgmt_code, "061");
+  // edit: rename + registration change reach the types of that receiver
+  const e = okData(post("receiver_save", { id: a.id, name: "หจก. เปลี่ยนชื่อ", reg: "5550002", mgmt_code: "" }));
+  assert.strictEqual(e.created, false);
+  const b = boot();
+  const ty = b.types.find(x => x.id === t.id);
+  assert.deepStrictEqual([ty.receiver, ty.receiver_reg], ["หจก. เปลี่ยนชื่อ", "5550002"]);
+  assert.strictEqual(b.receivers.find(x => x.id === a.id).name, "หจก. เปลี่ยนชื่อ");
+  assert.ok(b.receivers.every(x => x.name !== "หจก. ยังไม่มีประเภท"));
+  assert.ok(/เดิม: หจก\. ยังไม่มีประเภท \(5550001\).*→ ใหม่: หจก\. เปลี่ยนชื่อ \(5550002\)/.test(logs({ cat: "setting" })[0].detail));
+  err(post("receiver_save", { id: a.id, name: "บจก. ผู้รับใหม่" }), /มีผู้รับดำเนินการชื่อนี้อยู่แล้ว/);
+  err(post("receiver_save", { id: 9999, name: "x" }), /ไม่พบ/);
+});
+
+test("settings: deactivate / delete rules (receivers and types with movements are only deactivated)", () => {
+  const b0 = boot();
+  const used = b0.types.find(x => x.receiver === "บจก. ผู้รับใหม่" && x.has_moves);
+  const rc = b0.receivers.find(x => x.name === "บจก. ผู้รับใหม่");
+  // delete: refused while the type has movements / the receiver has types
+  err(post("type_delete", { id: used.id }), /มีรายการเคลื่อนไหวแล้ว.*ปิดใช้งาน/);
+  err(post("receiver_delete", { id: rc.id }), /ยังมีประเภทของเสียอยู่.*ปิดใช้งาน/);
+  // deactivate the receiver: refused while it has active types
+  err(post("receiver_save", { id: rc.id, name: rc.name, reg: rc.reg, active: 0 }), /ยังมีประเภทของเสียที่เปิดใช้งาน/);
+  for (const t of b0.types.filter(x => x.receiver === rc.name)) {
+    okData(post("type_save", { id: t.id, code: t.code, name: t.name, permit_tons: t.permit_tons, mgmt_code: t.mgmt_code, receiver_id: rc.id, active: 0 }));
+  }
+  // inactive types leave the receiver's quota (permit 0) but their stock and history stay
+  const rc1 = boot().receivers.find(x => x.id === rc.id);
+  assert.deepStrictEqual([rc1.types, rc1.active_types, rc1.permit_tons], [2, 0, 0]);
+  okData(post("receiver_save", { id: rc.id, name: rc.name, reg: rc.reg, active: 0 }));
+  assert.strictEqual(boot().receivers.find(x => x.id === rc.id).active, 0);
+  const bar = okData(get("dashboard")).receivers.find(x => x.receiver === rc.name);
+  assert.strictEqual(bar.balance_kg, 2500, "stock of a deactivated receiver is still shown");
+  // an inactive receiver cannot get an active type; reactivating works
+  err(post("type_save", { code: "130210", name: "x", permit_tons: 1, mgmt_code: "061", receiver_id: rc.id }), /ปิดใช้งานอยู่/);
+  okData(post("receiver_save", { id: rc.id, name: rc.name, reg: rc.reg, active: 1 }));
+  okData(post("type_save", { id: used.id, code: used.code, name: used.name, permit_tons: used.permit_tons, mgmt_code: used.mgmt_code, receiver_id: rc.id, active: 1 }));
+  // delete works when nothing refers to it
+  const fresh = okData(post("type_save", { code: "130211", name: "ลบได้", permit_tons: 1, mgmt_code: "061", receiver: "ผู้รับชั่วคราว" }));
+  assert.strictEqual(okData(post("type_delete", { id: fresh.id })).id, fresh.id);
+  const tmp = boot().receivers.find(x => x.name === "ผู้รับชั่วคราว");
+  okData(post("receiver_delete", { id: tmp.id }));
+  assert.ok(!boot().receivers.some(x => x.name === "ผู้รับชั่วคราว"));
+  assert.ok(logs({ cat: "setting" }).some(l => l.action === "receiver_delete"));
+});
+
+test("settings: older sheets without a receivers sheet keep working (receivers derived from types, stored on first write)", () => {
+  const ss = state.spreadsheets[state.props.WASTE_SPREADSHEET_ID];
+  const idx = ss.sheets.findIndex(s => s.name === "receivers");
+  const saved = ss.sheets.splice(idx, 1)[0];
+  ctx.clearReadCache();
+  try {
+    const b = boot();
+    const names = b.receivers.map(r => r.name);
+    assert.ok(names.includes("บจก. มั่นคงยั่งยืน รีไซเคิล") && b.receivers.every(r => r.id === 0 || r.id > 0));
+    assert.ok(b.receivers.length >= 3 && b.receivers.every(r => r.active === 1));
+    const rc = b.receivers.find(r => r.name === "บจก. มั่นคงยั่งยืน รีไซเคิล");
+    assert.deepStrictEqual([rc.types, rc.permit_tons], [3, 60]);
+    assert.ok(okData(get("dashboard")).receivers.some(r => r.receiver === "บจก. มั่นคงยั่งยืน รีไซเคิล" && r.permit_kg === 60000));
+    // first write: the sheet is created and seeded from the types, then editable by name
+    const e = okData(post("receiver_save", { current_name: "บจก. มั่นคงยั่งยืน รีไซเคิล", name: "บจก. มั่นคงยั่งยืน รีไซเคิล", reg: "10110020125675", mgmt_code: "011" }));
+    assert.ok(e.id > 0);
+    const rows = ss.getSheetByName("receivers").data.length - 1;
+    assert.ok(rows >= 3, "seeded rows: " + rows);
+    assert.strictEqual(boot().receivers.find(r => r.id === e.id).mgmt_code, "011");
+  } finally {
+    if (!ss.getSheetByName("receivers")) ss.sheets.splice(idx, 0, saved);
+    ctx.clearReadCache();
+  }
+});
+
+test("settings: admin only (viewer / staff / anonymous refused, nothing written)", () => {
+  const n0 = dataRows("receivers"), t0 = dataRows("waste_types");
+  const body = { name: "ไม่ควรสร้าง", code: "130299", permit_tons: 1, mgmt_code: "061", receiver: "ไม่ควรสร้าง", id: 1 };
+  for (const a of ["receiver_save", "receiver_delete", "type_save", "type_delete"]) {
+    err(post(a, { ...body, token: TS }), /ผู้ดูแลระบบ/);
+    err(post(a, { ...body, token: TV }), /ผู้ดูแลระบบ/);
+    err(post(a, { ...body, token: undefined }), /ผู้ดูแลระบบ/);
+  }
+  assert.strictEqual(dataRows("receivers"), n0);
+  assert.strictEqual(dataRows("waste_types"), t0);
+});
+
+test("two decimals everywhere: page helpers, inputs and README use 2-decimal tons", () => {
+  const app = fs.readFileSync(path.join(__dirname, "../docs/assets/app.js"), "utf8");
+  const readme = fs.readFileSync(path.join(__dirname, "../README.md"), "utf8");
+  assert.ok(!/0\.000/.test(app), "no 3-decimal placeholder left in app.js");
+  assert.ok(app.includes("fmtT = kg =>") && /minimumFractionDigits: 2, maximumFractionDigits: 2/.test(app));
+  assert.ok(app.includes("permitStr") && app.includes("ทศนิยมไม่เกิน 2 ตำแหน่ง"));
+  assert.ok(!/ทศนิยม 3 ตำแหน่ง/.test(readme), "README still says 3 decimals");
 });
 
 /* ---------- read cache / versions ---------- */
@@ -1316,10 +1460,12 @@ test("reset_data: admin session + password + name required; wipes movements and 
   err(post("reset_data", { resetPassword: "bad" }), /รหัสไม่ถูกต้อง/);
   clearFails();
   assert.ok(dataRows("movements") > 0);
+  const nTypes = dataRows("waste_types"), nRecv = dataRows("receivers");
   const r = okData(post("reset_data", { reads: [{ action: "bootstrap" }] }));
   assert.ok(r.removed.movements > 0 && r.removed.audit_logs > 0);
   assert.strictEqual(dataRows("movements"), 0);
-  assert.strictEqual(dataRows("waste_types"), 14);
+  assert.strictEqual(dataRows("waste_types"), nTypes);
+  assert.strictEqual(dataRows("receivers"), nRecv, "receivers are kept");
   const l = logs();
   assert.strictEqual(l.length, 1);
   assert.strictEqual(l[0].action, "reset_data");
@@ -1445,8 +1591,8 @@ test("docs JS files parse; config shape; POST text/plain only; token in the body
     app.slice(app.indexOf("const tonsStr = "), app.indexOf("/* ---------- container illustrations")) + "\nreturn { fmtT, tonsStr, parseT };")();
   assert.strictEqual(fx.tonsStr(125), "0.125");
   assert.strictEqual(fx.tonsStr(1234.56), "1.23456");
-  assert.strictEqual(fx.tonsStr(1000), "1");
-  assert.strictEqual(fx.tonsStr(100), "0.100");
+  assert.strictEqual(fx.tonsStr(1000), "1.00");
+  assert.strictEqual(fx.tonsStr(100), "0.10");
   assert.strictEqual(fx.tonsStr(0.01), "0.00001");
   assert.strictEqual(fx.parseT("0.125"), 125);
   assert.strictEqual(fx.parseT("1,234.5"), 1234500);
@@ -1513,7 +1659,7 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(css.includes(".nav a.locked .tn-lock{display:inline-block}") && css.includes(".unlock-card{") && css.includes(".locked-page{") && css.includes(".treat-bar{") && css.includes(".role-tag.r-admin"));
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
   // cache busters bumped with this change
-  assert.ok(html.includes("assets/app.js?v=10") && html.includes("assets/style.css?v=5"));
+  assert.ok(html.includes("assets/app.js?v=11") && html.includes("assets/style.css?v=5"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });
