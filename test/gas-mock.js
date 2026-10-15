@@ -1088,7 +1088,7 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"') && html.includes('data-page="settings"'));
   assert.ok(/data-page="treat"[^>]*id="treatNav"/.test(html) && html.includes('class="tn-lock"') && html.includes('id="treatLock"'), "treatment menu always listed with a lock badge + lock control");
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
-  assert.ok(html.includes("assets/app.js?v=3") && html.includes("assets/style.css?v=3"));
+  assert.ok(html.includes("assets/app.js?v=4") && html.includes("assets/style.css?v=3"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });

@@ -764,20 +764,20 @@ function txForm(page) {
   };
   const pick = () => { $('#tPick').innerHTML = typePicker(F.type_id, out ? 'ship' : 'store', F.q); };
   const errs = () => {
-    const out = {};
+    const e = {};
     const w = parseKg(F.weight);
-    if (!F.type_id) out.type = 'กรุณาเลือกประเภทของเสีย';
-    if (F.weight === '') out.w = 'กรุณากรอกน้ำหนัก';
-    else if (isNaN(w)) out.w = 'น้ำหนักต้องเป็นตัวเลข ทศนิยมไม่เกิน 2 ตำแหน่ง';
-    else if (!(w > 0)) out.w = 'น้ำหนักต้องมากกว่า 0';
-    if (!F.container) out.c = 'กรุณาเลือกภาชนะ';
-    if (!/^\d+$/.test(String(F.containers)) || +F.containers < 1) out.n = 'จำนวนภาชนะต้องเป็นจำนวนเต็มตั้งแต่ 1';
-    if (out && F.type_id) {
+    if (!F.type_id) e.type = 'กรุณาเลือกประเภทของเสีย';
+    if (F.weight === '') e.w = 'กรุณากรอกน้ำหนัก';
+    else if (isNaN(w)) e.w = 'น้ำหนักต้องเป็นตัวเลข ทศนิยมไม่เกิน 2 ตำแหน่ง';
+    else if (!(w > 0)) e.w = 'น้ำหนักต้องมากกว่า 0';
+    if (!F.container) e.c = 'กรุณาเลือกภาชนะ';
+    if (!/^\d+$/.test(String(F.containers)) || +F.containers < 1) e.n = 'จำนวนภาชนะต้องเป็นจำนวนเต็มตั้งแต่ 1';
+    if (out && F.type_id) { // stock-out forms only (ship / treat): not more than what is in the plant
       const b = balOf(F.type_id);
-      if (!out.w && w > b.balance_kg + 1e-9) out.w = `เกินยอดคงเหลือ (${fmtKg(b.balance_kg)} กก.)`;
-      if (F.container && !out.n && +F.containers > (b.containers[F.container] || 0)) out.n = `${CONT[F.container].name}ในคลังมี ${fmt(b.containers[F.container] || 0)} ภาชนะ`;
+      if (!e.w && w > b.balance_kg + 1e-9) e.w = `เกินยอดคงเหลือ (${fmtKg(b.balance_kg)} กก.)`;
+      if (F.container && !e.n && +F.containers > (b.containers[F.container] || 0)) e.n = `${CONT[F.container].name}ในคลังมี ${fmt(b.containers[F.container] || 0)} ภาชนะ`;
     }
-    return out;
+    return e;
   };
   const live = () => {
     const t = typeById(F.type_id), box = $('#liveBal');
