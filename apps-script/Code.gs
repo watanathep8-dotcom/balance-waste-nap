@@ -9,23 +9,27 @@
  * and stores the spreadsheet ID in Script Properties (WASTE_SPREADSHEET_ID).
  * Then deploy as a web app (Execute as: me, Who has access: Anyone).
  *
- * Login (3 access levels). Every API call except login / logout carries a
- * session token. The passwords are Script Properties only (never in the source):
- *   WASTE_VIEW_PASSWORD   viewer  "เข้าดูได้อย่างเดียว": every read (bootstrap,
- *                         dashboard, history, export, batch)
- *   WASTE_STAFF_PASSWORD  staff   "พนักงานกรอกข้อมูล": viewer + store / opening / ship
- *   WASTE_RESET_PASSWORD  admin   "ผู้ดูแลระบบ": everything (edit / delete movements,
- *                         waste types, audit log, reset_data, ข้อมูลภายใน)
- * An unset property means that level cannot log in. login compares the password
+ * Open site: anyone may read (dashboard, balance, history, export) and record
+ * store / opening / ship without a password. The name typed in the top-right
+ * of the page is sent as "actor" and recorded on every movement and audit_logs
+ * row ("ผู้บันทึก"); writes need it.
+ *
+ * Password levels (the "ข้อมูลภายใน" menu and the admin tools). The passwords
+ * are Script Properties only (never in the source):
+ *   WASTE_VIEW_PASSWORD   viewer  "ดูได้อย่างเดียว": may see the in-house rows
+ *                         (TR- list, details, CSV) but not record them
+ *   WASTE_STAFF_PASSWORD  staff   "พนักงานกรอกข้อมูล": viewer + record "treat"
+ *   WASTE_RESET_PASSWORD  admin   "ผู้ดูแลระบบ": everything (also edit / delete
+ *                         any movement, waste types, audit log, reset_data)
+ * An unset property means that level cannot unlock. login compares the password
  * with all three (SHA-256 digests, constant time, highest role wins) and issues
  * a random token kept in CacheService (SESSION_TTL = 12 h absolute; the cache
  * entry is renewed while in use because CacheService keeps a value <= 6 h).
  * Changing / removing a password ends the sessions of that level. Wrong
  * passwords: 1 s delay each; lockout per client (5 / 15 min) and global
- * (30 / 15 min). The server checks the role on EVERY action (ACTION_ROLE).
+ * (30 / 15 min). The server checks the level on EVERY action (ACTION_ROLE);
+ * a public action ignores a missing / unknown token (it is simply anonymous).
  * reset_data also needs the admin password typed again (same lockout).
- * The name typed in the top-right of the page is sent as "actor" and recorded
- * on every movement and audit_logs row ("ผู้บันทึก"); writes need it.
  *
  * Ledger integrity: every write that changes movements (ship, edit, delete,
  * also store/opening) is checked by replaying ALL movements in time order
@@ -39,22 +43,25 @@
  * API numbers stay *_kg; every text the server writes (messages, audit log,
  * CSV) shows tons.
  *
- * In-house data (kind "treat", ข้อมูลภายใน): stock handled inside the plant
- * (e.g. the plant's own wastewater system). It leaves the in-plant balance
- * exactly like a shipment (same replay / container checks) but is NOT a
- * shipment: the สก.2 quota (quota %, receiver quotas) counts "ship" only. Only
- * admin sessions ever receive it (rows, totals, CSV column); every other read
- * leaves it out (balances stay true: balance = in - shipped - treat). An admin
- * page may also ask to hide it (hideTreat). Writing "treat" needs admin. Every
- * row is still in the movements sheet and in audit_logs.
+ * In-house data (kind "treat", ข้อมูลภายใน; shown as "บำบัดเอง" in totals):
+ * stock handled inside the plant (e.g. the plant's own wastewater system). It
+ * leaves the in-plant balance exactly like a shipment (same replay / container
+ * checks) but is NOT a shipment: the สก.2 quota (quota %, receiver quotas)
+ * counts "ship" only. Aggregate totals (per-type treated_kg, dashboard KPIs and
+ * the monthly series) are public and the dashboard is the same for everyone.
+ * The individual TR- rows (date, method, note, recorder: history, CSV, the
+ * time of the last movement) are sent only to a request with a valid session
+ * of any level that does not ask to hide them (hideTreat). Recording "treat"
+ * needs staff. Every row is still in the movements sheet and in audit_logs.
  *
  * Optional: run installKeepWarmTrigger() once from the editor; a 10-minute
  * trigger then runs keepWarm() (read-only) to keep the read cache hot.
  *
  * Transport (no CORS preflight): POST text/plain JSON
- *   {action, token, actor, ...fields} -> {ok:true,data} | {ok:false,error,code}
- *   code AUTH_REQUIRED (no / expired session) or FORBIDDEN (role too low).
- *   GET without an action answers the service info only (tokens never in URLs).
+ *   {action, token?, actor, ...fields} -> {ok:true,data} | {ok:false,error,code}
+ *   code AUTH_REQUIRED (no / expired session) or FORBIDDEN (level too low).
+ *   GET ?action=<public read> also works but never uses a token (anonymous);
+ *   anything carrying a token is POST only, so a token never sits in a URL.
  */
 
 var SPREADSHEET_ID_PROPERTY = "WASTE_SPREADSHEET_ID";
@@ -65,13 +72,16 @@ var RESET_ACTION = "reset_data";
 var RESET_PASSWORD_PROPERTY = "WASTE_RESET_PASSWORD";
 var ROLE_PROPERTY = { viewer: "WASTE_VIEW_PASSWORD", staff: "WASTE_STAFF_PASSWORD", admin: RESET_PASSWORD_PROPERTY };
 var ROLE_LEVEL = { viewer: 1, staff: 2, admin: 3 };
-var ROLE_NAME = { viewer: "เข้าดูได้อย่างเดียว", staff: "พนักงานกรอกข้อมูล", admin: "ผู้ดูแลระบบ" };
+var ROLE_NAME = { viewer: "ดูได้อย่างเดียว", staff: "พนักงานกรอกข้อมูล", admin: "ผู้ดูแลระบบ" };
 var ROLE_ORDER = ["admin", "staff", "viewer"]; // the same password set for two levels: the higher one wins
-// The lowest role allowed to run each action (checked on every request).
+// The lowest level allowed to run each action (checked on every request).
+// "public": no password (a token, if any, only widens what reads may show).
+var PUBLIC = "public";
 var ACTION_ROLE = {
-  bootstrap: "viewer", dashboard: "viewer", history: "viewer", "export": "viewer", batch: "viewer",
-  store: "staff", opening: "staff", ship: "staff",
-  treat: "admin", movement_update: "admin", movement_delete: "admin", type_save: "admin",
+  bootstrap: PUBLIC, dashboard: PUBLIC, history: PUBLIC, "export": PUBLIC, batch: PUBLIC,
+  store: PUBLIC, opening: PUBLIC, ship: PUBLIC,
+  treat: "staff",
+  movement_update: "admin", movement_delete: "admin", type_save: "admin",
   reset_data: "admin", logs: "admin", logs_export: "admin"
 };
 var SESSION_PREFIX = "WASTE_SS_";
@@ -157,7 +167,7 @@ var SEED_TYPES = [
   ["161001", "น้ำล้างเครื่องจักร (น้ำแรก)", 40, "065", "10103300225380", RCV_GENCO, "fa-faucet-drip", "#14B8A6"]
 ];
 
-var READ_ACTIONS = ["bootstrap", "dashboard", "history", "export", "logs", "logs_export", "batch"]; // POST only (token)
+var READ_ACTIONS = ["bootstrap", "dashboard", "history", "export", "logs", "logs_export", "batch"];
 // "batch": several reads in one request; writes accept the same optional
 // "reads" list and return the post-write results as data.reads.
 var BATCH_ACTIONS = ["bootstrap", "dashboard", "history"];
@@ -183,12 +193,19 @@ var MAX_TEXT = 255;
 
 /* ===================== web app entry points ===================== */
 
-// Reads carry a session token, so they are POST only (a token never goes into a URL).
+// GET: public reads only, always anonymous (a token in a URL is never used).
+// Everything else (and every request carrying a token) is POST.
 function doGet(e) {
   var params = (e && e.parameter) || {};
   var action = String(params.action || "");
   try {
     if (!action) return jsonResponse_({ ok: true, data: { service: "Balance Waste API" } });
+    if (READ_ACTIONS.indexOf(action) !== -1 && ACTION_ROLE[action] === PUBLIC) {
+      resetRequest_("");
+      REQ_.role = null;
+      REQ_.treat = false;
+      return jsonResponse_({ ok: true, data: runRead_(action, params) });
+    }
     if (action === "login" || action === "logout" || Object.prototype.hasOwnProperty.call(ACTION_ROLE, action)) {
       throw new Error("คำสั่งนี้ต้องส่งแบบ POST");
     }
@@ -215,8 +232,12 @@ function doPost(e) {
     if (action === "logout") return jsonResponse_({ ok: true, data: actionLogout_(payload.token) });
     if (!Object.prototype.hasOwnProperty.call(ACTION_ROLE, action)) fail_("Unknown action");
     // Server-side access control on every action (never trusts the page).
-    sess = requireRole_(payload.token, ACTION_ROLE[action]);
-    sess.treat = sess.role === "admin" && !phpTruthy_(payload.hideTreat);
+    // Public actions: a missing / unknown / expired token is simply anonymous.
+    sess = ACTION_ROLE[action] === PUBLIC
+      ? (session_(payload.token) || { role: null })
+      : requireRole_(payload.token, ACTION_ROLE[action]);
+    // In-house rows: any valid session that does not ask to hide them.
+    sess.treat = Boolean(sess.role) && !phpTruthy_(payload.hideTreat);
     if (READ_ACTIONS.indexOf(action) !== -1) {
       resetRequest_("");
       REQ_.role = sess.role;
@@ -440,7 +461,9 @@ function session_(token) {
 
 function requireRole_(token, need) {
   var s = session_(token);
-  if (!s) fail_("กรุณาเข้าสู่ระบบ (ยังไม่ได้เข้าสู่ระบบ หรือเซสชันหมดอายุ)", "AUTH_REQUIRED");
+  if (!s) {
+    fail_("ต้องใส่รหัสผ่าน “" + ROLE_NAME[need] + "” ขึ้นไปก่อน (ยังไม่ได้ปลดล็อก หรือหมดเวลา)", "AUTH_REQUIRED");
+  }
   if (ROLE_LEVEL[s.role] < ROLE_LEVEL[need]) {
     fail_("สิทธิ์ “" + ROLE_NAME[s.role] + "” ทำรายการนี้ไม่ได้ (ต้องเป็น “" + ROLE_NAME[need] + "”)", "FORBIDDEN");
   }
@@ -462,7 +485,8 @@ function assertResetPassword_(password, client) {
   }
 }
 
-// True while the current request may see / write in-house (treat) data: admin only.
+// True while the current request may see the individual in-house (treat) rows:
+// a valid session of any level that did not ask to hide them. Totals are public.
 function treatOn_() {
   return Boolean(REQ_ && REQ_.treat);
 }
@@ -519,8 +543,8 @@ function sortedTypes_() {
 
 // Per waste type: totals, containers in storage, this year's shipments vs the
 // permitted quantity and the date of the oldest lot still in storage (FIFO).
-// treated_kg / treated_year_kg are only for requests that may see treatment
-// (see publicBalances_); balance_kg is always the true in-plant balance.
+// treated_kg / treated_year_kg (in-house totals) are public; balance_kg is
+// always the true in-plant balance (see publicBalances_ for last_at).
 function balances_() {
   var now = nowParts_();
   var year = now.date.slice(0, 4);
@@ -591,18 +615,14 @@ function balances_() {
   return out;
 }
 
-// Balances as sent to a request: without the treatment totals when it may not
-// see treatment (the balance itself is unchanged).
+// Balances as sent to a request. The totals are public; without access to the
+// in-house rows last_at never shows the time of one (row-level detail).
 function publicBalances_(bal) {
   var showTreat = treatOn_();
   var out = {};
   Object.keys(bal).forEach(function (id) {
     var o = plain_(bal[id]);
-    if (!showTreat) {
-      delete o.treated_kg;
-      delete o.treated_year_kg;
-      o.last_at = o.last_vis_at; // the time of a treatment row is not shown either
-    }
+    if (!showTreat) o.last_at = o.last_vis_at;
     delete o.last_vis_at;
     out[id] = o;
   });
@@ -666,7 +686,7 @@ function typeLabel_(id) {
 
 function actionBootstrap_() {
   var now = nowParts_();
-  var core = cachedDerived_("boot_" + modeTag_() + now.date, ["waste_types", "movements"], function () {
+  var core = cachedDerived_("boot2_" + modeTag_() + now.date, ["waste_types", "movements"], function () {
     return { types: sortedTypes_().map(plain_), balance: publicBalances_(balances_()) };
   });
   return {
@@ -687,7 +707,7 @@ function modeTag_() {
   return treatOn_() ? "t_" : "";
 }
 
-// Movements a request may see (in-house "treat" rows for admin only).
+// Movements a request may see (in-house "treat" rows only with access, see treatOn_).
 function visibleMoves_() {
   var rows = table_("movements").rows;
   return treatOn_() ? rows : rows.filter(function (m) { return m.kind !== "treat"; });
@@ -697,11 +717,14 @@ function actionDashboard_() {
   var now = nowParts_();
   var month = now.date.slice(0, 7);
   var year = now.date.slice(0, 4);
-  var core = cachedDerived_("dash_" + modeTag_() + now.date, ["waste_types", "movements", "audit_logs"], function () {
+  // The same for everyone (with or without a session): in-house totals and the
+  // monthly series are public, individual in-house rows never appear here.
+  // ("2" in the cache ids: a new shape, never reuse a cached answer of the previous version)
+  var core = cachedDerived_("dash2_" + now.date, ["waste_types", "movements", "audit_logs"], function () {
     var types = sortedTypes_();
     var bal = balances_();
-    var showTreat = treatOn_();
-    var moves = visibleMoves_();
+    var moves = table_("movements").rows;
+    var publicMoves = moves.filter(function (m) { return m.kind !== "treat"; });
 
     // last 12 months (oldest first): kg stored / shipped
     var months = [];
@@ -758,7 +781,7 @@ function actionDashboard_() {
     });
     alerts.sort(function (a, b) { return (a.level === "bad" ? 0 : 1) - (b.level === "bad" ? 0 : 1); });
 
-    var recent = sortBy_(moves.slice(), byMovedDesc_).slice(0, 10).map(plain_);
+    var recent = sortBy_(publicMoves.slice(), byMovedDesc_).slice(0, 10).map(plain_);
     var kpi = {
         balance_kg: kgOf_(totalBal),
         month_in_kg: kgOf_(monthIn),
@@ -767,22 +790,18 @@ function actionDashboard_() {
         year_out_kg: kgOf_(totalYear),
         permit_kg: kgOf_(totalPermit),
         quota_pct: totalPermit > 0 ? Math.round(totalYear / totalPermit * 1000) / 10 : null,
-        moves: moves.length
+        moves: publicMoves.length,
+        // All-time totals that add up: in = shipped + treated + balance.
+        total_in_kg: kgOf_(totalIn),
+        shipped_kg: kgOf_(totalShip),
+        treated_kg: kgOf_(totalTreat),
+        month_treat_kg: kgOf_(monthTreat),
+        year_treat_kg: kgOf_(yearTreat)
     };
-    if (showTreat) {
-      // All-time totals that add up: in = shipped + treated + balance.
-      kpi.total_in_kg = kgOf_(totalIn);
-      kpi.shipped_kg = kgOf_(totalShip);
-      kpi.treated_kg = kgOf_(totalTreat);
-      kpi.month_treat_kg = kgOf_(monthTreat);
-      kpi.year_treat_kg = kgOf_(yearTreat);
-    }
     return {
       kpi: kpi,
       months: months.map(function (m) {
-        var o = { ym: m.ym, in_kg: kgOf_(m.in_c), out_kg: kgOf_(m.out_c) };
-        if (showTreat) o.treat_kg = kgOf_(m.treat_c);
-        return o;
+        return { ym: m.ym, in_kg: kgOf_(m.in_c), out_kg: kgOf_(m.out_c), treat_kg: kgOf_(m.treat_c) };
       }),
       containers: containers,
       receivers: recvOrder.map(function (k) {
@@ -796,14 +815,14 @@ function actionDashboard_() {
       alerts: alerts,
       recent: recent,
       logsToday: table_("audit_logs").rows.filter(function (l) {
-        return l.created_at.slice(0, 10) === now.date && (showTreat || !treatLog_(l));
+        return l.created_at.slice(0, 10) === now.date && !treatLog_(l);
       }).length
     };
   });
   return core;
 }
 
-// Audit rows about treatment (left out of counts in hidden mode).
+// Audit rows about in-house data (left out of the public dashboard count).
 function treatLog_(l) {
   return l.action === "treat" || l.action === "treat_unlock" || /^TR-/.test(String(l.ref || "")); // treat_unlock: older rows
 }
@@ -837,7 +856,7 @@ function queryHistory_(p) {
   });
 }
 
-// "รายการ" is the movement type column; weights in tons. For admin the export
+// "รายการ" is the movement type column; weights in tons. With access (treatOn_) the export
 // also has the in-house (treat) rows and a "ระบบ / วิธีการ" column; such a row
 // has no receiver (handled inside the plant, not shipped).
 function exportHistory_(items) {
@@ -1697,7 +1716,7 @@ function setupSystem() {
     resetPasswordConfigured: passwords[RESET_PASSWORD_PROPERTY],
     passwords: passwords,
     passwordMessage: missing.length
-      ? "ยังไม่ได้ตั้ง Script Property: " + missing.join(", ") + " — ระดับนั้นจะเข้าสู่ระบบไม่ได้จนกว่าจะตั้งค่า (Project Settings > Script properties)"
+      ? "ยังไม่ได้ตั้ง Script Property: " + missing.join(", ") + " — ระดับนั้นจะใส่รหัสปลดล็อกไม่ได้จนกว่าจะตั้งค่า (Project Settings > Script properties)"
       : "ตั้งรหัสผ่านครบทั้ง 3 ระดับแล้ว"
   };
   console.log(JSON.stringify(result));

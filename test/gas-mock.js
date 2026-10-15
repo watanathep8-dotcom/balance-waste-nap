@@ -240,10 +240,13 @@ const ctx = loadCode(gas);
 const VPW = "view-pass", SPW = "staff-pass", RPW = "admin-pass";
 const PROPS = { WASTE_VIEW_PASSWORD: VPW, WASTE_STAFF_PASSWORD: SPW, WASTE_RESET_PASSWORD: RPW };
 const ACTOR = "Tester";
+// public (no password), the in-house write (staff+), admin tools
 const READS = ["bootstrap", "dashboard", "history", "export", "batch"];
-const STAFF_WRITES = ["store", "ship", "opening"];
-const ADMIN_ONLY = ["treat", "movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export"];
-const ALL_ACTIONS = READS.concat(STAFF_WRITES, ADMIN_ONLY);
+const PUBLIC_WRITES = ["store", "ship", "opening"];
+const STAFF_ONLY = ["treat"];
+const ADMIN_ONLY = ["movement_update", "movement_delete", "type_save", "reset_data", "logs", "logs_export"];
+const PUBLIC_ACTIONS = READS.concat(PUBLIC_WRITES);
+const ALL_ACTIONS = PUBLIC_ACTIONS.concat(STAFF_ONLY, ADMIN_ONLY);
 const getRaw = (params = {}) => {
   const out = ctx.doGet({ parameter: params });
   assert.strictEqual(out.getMimeType(), "application/json");
@@ -255,10 +258,13 @@ const loginRes = (password, client) => rawPost({ action: "login", password, clie
 const login = (password, client) => okData(loginRes(password, client)).token;
 // session tokens of the three levels (set after login)
 let TV = "", TS = "", TA = "";
-const tokFor = a => STAFF_WRITES.includes(a) ? TS : READS.includes(a) ? TV : TA;
+// the lowest token each action needs: none for the public ones
+const tokFor = a => PUBLIC_ACTIONS.includes(a) ? undefined : STAFF_ONLY.includes(a) ? TS : TA;
 const post = (action, body = {}, who = ACTOR) => postRaw(Object.assign({ token: tokFor(action) }, action === "reset_data" ? { resetPassword: RPW } : {}, body, { action }), who);
-// a read as the viewer (all reads are POST with a session token)
-const get = (action, params = {}) => postRaw(Object.assign({ action, token: TV }, params), null);
+// a public read (anonymous POST, no token)
+const get = (action, params = {}) => postRaw(Object.assign({ action }, params), null);
+// the level a token gets on a public read (null: anonymous / unknown / expired)
+const roleOf = tok => okData(postRaw({ action: "bootstrap", token: tok }, null)).role;
 const okData = res => { assert.strictEqual(res.ok, true, "expected ok, got: " + JSON.stringify(res)); return res.data; };
 const err = (res, re) => {
   assert.strictEqual(res.ok, false, "expected error, got: " + JSON.stringify(res).slice(0, 300));
@@ -295,7 +301,7 @@ test("login: no password property set -> nobody can log in (clear Thai message n
   const r = err(loginRes("anything"), /ยังไม่ได้ตั้งรหัสผ่านใน Script Properties/);
   assert.ok(/WASTE_RESET_PASSWORD, WASTE_STAFF_PASSWORD, WASTE_VIEW_PASSWORD/.test(r.error), r.error);
   assert.strictEqual(r.passwordError, true);
-  err(get("bootstrap"), /เข้าสู่ระบบ/);
+  err(get("bootstrap"), /setupSystem/); // public read: no password needed (only the setup is missing)
 });
 
 test("API before setup: reads and writes report the setupSystem error (after a valid login)", () => {
@@ -312,7 +318,7 @@ test("setupSystem creates spreadsheet, 3 sheets, headers and seeds the 13 permit
   assert.strictEqual(r.seededTypes, 13);
   assert.strictEqual(r.resetPasswordConfigured, false);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(r.passwords)), { WASTE_RESET_PASSWORD: false, WASTE_STAFF_PASSWORD: false, WASTE_VIEW_PASSWORD: false });
-  assert.ok(/ยังไม่ได้ตั้ง Script Property: WASTE_RESET_PASSWORD \(ผู้ดูแลระบบ\), WASTE_STAFF_PASSWORD \(พนักงานกรอกข้อมูล\), WASTE_VIEW_PASSWORD \(เข้าดูได้อย่างเดียว\).*เข้าสู่ระบบไม่ได้/.test(r.passwordMessage), r.passwordMessage);
+  assert.ok(/ยังไม่ได้ตั้ง Script Property: WASTE_RESET_PASSWORD \(ผู้ดูแลระบบ\), WASTE_STAFF_PASSWORD \(พนักงานกรอกข้อมูล\), WASTE_VIEW_PASSWORD \(ดูได้อย่างเดียว\).*ปลดล็อกไม่ได้/.test(r.passwordMessage), r.passwordMessage);
   const ss = state.spreadsheets[state.props.WASTE_SPREADSHEET_ID];
   assert.strictEqual(ss.tz, "Asia/Bangkok");
   assert.strictEqual(ss.name, "Balance Waste Database");
@@ -364,15 +370,19 @@ test("setupSystem is idempotent (no second spreadsheet, no duplicate seed)", () 
   assert.strictEqual(r.passwordMessage, "ตั้งรหัสผ่านครบทั้ง 3 ระดับแล้ว");
   // one level unset: only that level is named
   delete state.props.WASTE_VIEW_PASSWORD;
-  assert.ok(/^ยังไม่ได้ตั้ง Script Property: WASTE_VIEW_PASSWORD \(เข้าดูได้อย่างเดียว\) — /.test(ctx.setupSystem().passwordMessage));
+  assert.ok(/^ยังไม่ได้ตั้ง Script Property: WASTE_VIEW_PASSWORD \(ดูได้อย่างเดียว\) — /.test(ctx.setupSystem().passwordMessage));
   state.props.WASTE_VIEW_PASSWORD = VPW;
 });
 
 /* ---------- transport ---------- */
-test("GET: service info only; every action (reads too) refused over GET, so a token never sits in a URL", () => {
+test("GET: public reads work anonymously (a token in the URL is ignored); every other action is POST only", () => {
   assert.strictEqual(okData(getRaw({})).service, "Balance Waste API");
   err(getRaw({ action: "nope" }), /Unknown action/);
-  for (const a of ALL_ACTIONS.concat(["login", "logout"])) err(getRaw({ action: a, token: TA }), /POST/);
+  for (const a of READS) {
+    const d = okData(getRaw({ action: a, token: TA, reads: JSON.stringify(["bootstrap"]) }));
+    if (a === "bootstrap") assert.ok(d.role === null && d.treat === false, "a token in a URL is never used");
+  }
+  for (const a of PUBLIC_WRITES.concat(STAFF_ONLY, ADMIN_ONLY, ["login", "logout"])) err(getRaw({ action: a, token: TA }), /POST/);
   for (const a of ["treat_unlock", "treat_lock", "verifyResetPassword"]) err(getRaw({ action: a }), /Unknown action/); // removed
   const bad = JSON.parse(ctx.doPost({ postData: { contents: "{oops" } }).getContent());
   err(bad, /JSON/);
@@ -691,27 +701,29 @@ test("CSV export: Thai headers, codes keep leading zeros, formula-like text neut
   assert.strictEqual(row[10], "=HYPERLINK(\"http://x\")"); // stored as text via apostrophe
 });
 
-/* ---------- in-house data (ข้อมูลภายใน, kind "treat"): admin only ---------- */
+/* ---------- in-house data (ข้อมูลภายใน, kind "treat"): rows need a password, totals are public ---------- */
 // a read with a given session token
 const tread = (tok, action, params = {}) => okData(postRaw(Object.assign({ action, token: tok }, params), null));
 let TR1 = null;
 
-test("treat: admin only (staff / viewer FORBIDDEN, nothing written); the old unlock flow is gone", () => {
+test("treat: recording needs staff or admin (viewer FORBIDDEN, anonymous / bad token AUTH_REQUIRED, nothing written)", () => {
   const before = dataRows("movements");
-  for (const tok of [TS, TV]) {
-    const r = err(mv("treat", 11, 5, { token: tok }), /ต้องเป็น “ผู้ดูแลระบบ”/);
-    assert.strictEqual(r.code, "FORBIDDEN");
+  let r = err(mv("treat", 11, 5, { token: TV }), /ต้องเป็น “พนักงานกรอกข้อมูล”/);
+  assert.strictEqual(r.code, "FORBIDDEN");
+  for (const tok of [undefined, "", "a".repeat(64), TA + "0"]) {
+    r = err(mv("treat", 11, 5, { token: tok }), /ต้องใส่รหัสผ่าน “พนักงานกรอกข้อมูล”/);
+    assert.strictEqual(r.code, "AUTH_REQUIRED");
   }
-  err(mv("treat", 11, 5, { token: "a".repeat(64) }), /เข้าสู่ระบบ/);
   assert.strictEqual(dataRows("movements"), before);
-  assert.ok(boot().treat === false && tread(TS, "bootstrap").treat === false && tread(TA, "bootstrap").treat === true);
-  assert.strictEqual(tread(TA, "bootstrap", { hideTreat: true }).treat, false, "admin may hide it on screen");
+  assert.strictEqual(boot().treat, false, "anonymous: no in-house rows");
+  for (const tok of [TV, TS, TA]) assert.strictEqual(tread(tok, "bootstrap").treat, true, "every level sees the rows");
+  assert.strictEqual(tread(TA, "bootstrap", { hideTreat: true }).treat, false, "a page may ask to hide them");
 });
 
 test("treat: lowers the in-plant balance like a shipment but is never counted in the สก.2 quota", () => {
   okData(mv("store", 12, 300, { container: "drum200", containers: 3, ...at(6) }));
   okData(mv("ship", 12, 100, { container: "drum200", containers: 1, ...at(4) }));
-  const d0 = tread(TA, "dashboard");
+  const d0 = okData(get("dashboard"));
   const r = okData(mv("treat", 12, 150, { container: "drum200", containers: 1, method: "ระบบบำบัดน้ำเสียภายในโรงงาน", note: "ทดสอบ", ...at(3) }));
   TR1 = r;
   assert.strictEqual(r.doc_no, "TR-" + YMD + "-0001");
@@ -720,9 +732,10 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   assert.ok(/^ข้อมูลภายใน .* 0\.150 ตัน เรียบร้อย/.test(r.message), r.message);
   const row = sheet("movements").data.find(x => x[1] === r.doc_no);
   assert.strictEqual(row[2], "treat");
+  assert.strictEqual(row[13], ACTOR, "recorded under the name set on the page");
   assert.strictEqual(row[16], "ระบบบำบัดน้ำเสียภายในโรงงาน"); // method: appended column
   assert.strictEqual(row[8], ""); // no manifest / vehicle for a treatment
-  // viewer / staff view: true balance, quota counts the shipment only, no treatment totals
+  // public (no password): true balance, quota counts the shipment only, in-house totals shown
   const b = bal(12);
   assert.strictEqual(b.balance_kg, 50);
   assert.strictEqual(b.containers.drum200, 1);
@@ -730,17 +743,13 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   assert.strictEqual(b.shipped_year_kg, 100);
   assert.strictEqual(b.permit_kg, 500);
   assert.strictEqual(b.quota_pct, 20);
-  assert.ok(!("treated_kg" in b) && !("treated_year_kg" in b));
+  assert.strictEqual(b.treated_kg, 150);
+  assert.strictEqual(b.treated_year_kg, 150);
+  assert.strictEqual(Math.round((b.in_kg - b.shipped_kg - b.treated_kg) * 100) / 100, b.balance_kg);
   assert.strictEqual(boot().treat, false);
-  // admin view: the in-house totals add up
-  const bt = tread(TA, "bootstrap");
-  assert.strictEqual(bt.treat, true);
-  const u = bt.balance[12];
-  assert.strictEqual(u.treated_kg, 150);
-  assert.strictEqual(u.treated_year_kg, 150);
-  assert.strictEqual(u.quota_pct, 20);
-  assert.strictEqual(Math.round((u.in_kg - u.shipped_kg - u.treated_kg) * 100) / 100, u.balance_kg);
-  const d = tread(TA, "dashboard");
+  assert.strictEqual(tread(TV, "bootstrap").balance[12].treated_kg, 150);
+  // public dashboard: the summary card (all = บำบัดเอง + ส่งกำจัด + คงเหลือ) and the monthly series
+  const d = okData(get("dashboard"));
   assert.strictEqual(d.kpi.year_out_kg, d0.kpi.year_out_kg, "quota use unchanged by a treatment");
   assert.strictEqual(d.kpi.quota_pct, d0.kpi.quota_pct);
   assert.deepStrictEqual(d.receivers.map(x => x.shipped_year_kg), d0.receivers.map(x => x.shipped_year_kg));
@@ -756,7 +765,7 @@ test("treat: lowers the in-plant balance like a shipment but is never counted in
   assert.ok(l.detail.startsWith("ข้อมูลภายใน ") && l.detail.includes("0.150 ตัน") && l.detail.includes("ระบบ / วิธีการ: ระบบบำบัดน้ำเสียภายในโรงงาน") && l.actor === ACTOR, l.detail);
 });
 
-test("treat: cannot exceed the balance or containers (chronological replay); hidden error never names the treatment row", () => {
+test("treat: cannot exceed the balance or containers (chronological replay); without access the error never names the in-house row", () => {
   const before = dataRows("movements");
   let r = err(mv("treat", 12, "50.01", { ...at(2) }), /ข้อมูลภายในเกินยอดคงเหลือ/);
   assert.strictEqual(r.code, "NEGATIVE_BALANCE");
@@ -765,72 +774,77 @@ test("treat: cannot exceed the balance or containers (chronological replay); hid
   err(mv("treat", 4, 1, { ...at(2) }), /มี 0\.000 ตัน/);
   err(mv("treat", 12, 10, { ...at(7) }), /ข้อมูลภายในเกินยอดคงเหลือ/); // before the stock existed
   err(mv("treat", 12, 10, { method: "x".repeat(121), ...at(2) }), /ระบบ \/ วิธีการยาวเกิน 120/);
-  // a back-dated shipment that would make the later treatment negative
-  r = err(mv("ship", 12, 60, { ...at(5) }), /ติดลบในรายการภายหลัง/); // staff: the in-house row is not named
+  // a back-dated (public) shipment that would make the later in-house row negative
+  r = err(mv("ship", 12, 60, { ...at(5) }), /ติดลบในรายการภายหลัง/); // anonymous: the in-house row is not named
   assert.ok(!/TR-|ภายใน\)/.test(r.error), r.error);
-  r = err(mv("ship", 12, 60, { token: TA, ...at(5) }), /ติดลบที่รายการ TR-.*\(ข้อมูลภายใน\)/);
-  r = err(mv("ship", 12, 60, { token: TA, hideTreat: 1, ...at(5) }), /ติดลบในรายการภายหลัง/); // admin hiding it
+  for (const tok of [TV, TS, TA]) err(mv("ship", 12, 60, { token: tok, ...at(5) }), /ติดลบที่รายการ TR-.*\(ข้อมูลภายใน\)/);
+  err(mv("ship", 12, 60, { token: TA, hideTreat: 1, ...at(5) }), /ติดลบในรายการภายหลัง/); // hidden on that page
   assert.strictEqual(dataRows("movements"), before);
   okData(mv("treat", 12, "0.5", { ...at(2) }));
   assert.strictEqual(bal(12).balance_kg, 49.5);
 });
 
-test("in-house data only for admin: history / CSV / dashboard / batch leave it out for viewer + staff (and admin hiding it)", () => {
-  for (const tok of [TV, TS]) {
+test("in-house rows: only with a password (any level); dashboard identical for everyone; totals public", () => {
+  // anonymous (and a bad / expired token): no rows anywhere
+  for (const tok of [undefined, "f".repeat(64)]) {
     const all = tread(tok, "history").items;
     assert.ok(all.length > 0 && all.every(m => m.kind !== "treat"));
     assert.strictEqual(all.length, dataRows("movements") - 2);
     assert.strictEqual(tread(tok, "history", { kind: "treat" }).items.length, 0);
     assert.strictEqual(tread(tok, "history", { q: "บำบัดน้ำเสีย" }).items.length, 0);
     assert.strictEqual(tread(tok, "history", { q: "TR-" }).items.length, 0);
-    const dh = tread(tok, "dashboard");
-    assert.ok(!/treat|TR-/.test(JSON.stringify(dh)), "no in-house data in the dashboard");
-    assert.ok(!/treated|TR-/.test(JSON.stringify(tread(tok, "bootstrap"))));
     const bh = tread(tok, "batch", { reads: [{ action: "history", kind: "treat" }] });
     assert.strictEqual(bh.results[0].items.length, 0);
     const c0 = tread(tok, "export", { type: "12" }).csv;
     assert.ok(!/TR-|ภายในโรงงาน|ระบบ \/ วิธีการ/.test(c0), "CSV without in-house rows / column");
+    assert.ok(!/TR-|ระบบบำบัดน้ำเสียภายในโรงงาน/.test(JSON.stringify(tread(tok, "bootstrap"))));
   }
-  // a client flag never widens access: viewer / staff asking hideTreat: false still get nothing
-  assert.strictEqual(tread(TS, "bootstrap", { hideTreat: false, treat: true }).treat, false);
-  // admin hiding it on screen: same as staff
-  const hid = tread(TA, "history", { hideTreat: true });
-  assert.ok(hid.items.every(m => m.kind !== "treat"));
-  assert.ok(!/treated/.test(JSON.stringify(tread(TA, "bootstrap", { hideTreat: 1 }))));
-  // admin
-  const th = tread(TA, "history", { kind: "treat" }).items;
-  assert.strictEqual(th.length, 2);
-  assert.strictEqual(th[1].method, "ระบบบำบัดน้ำเสียภายในโรงงาน");
-  assert.strictEqual(tread(TA, "history").items.length, dataRows("movements"));
-  assert.strictEqual(tread(TA, "history", { q: "บำบัดน้ำเสีย" }).items.length, 1);
-  assert.ok(tread(TA, "dashboard").recent.some(m => m.kind === "treat"));
-  const bt = tread(TA, "batch", { reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] });
-  assert.strictEqual(bt.results[0].treat, true);
-  assert.strictEqual(bt.results[1].items.length, 2);
-  // CSV (tons)
-  const c1 = tread(TA, "export", { type: "12" }).csv;
-  const lines = c1.trim().split("\n");
-  assert.ok(lines[0].includes(",\"น้ำหนัก (ตัน)\",") && lines[0].endsWith(",ผู้บันทึก,\"ระบบ / วิธีการ\""), lines[0]);
-  const tr = lines.find(x => x.startsWith(TR1.doc_no));
-  assert.ok(tr && tr.includes(",ข้อมูลภายใน,") && tr.includes(",ภายในโรงงาน,0.150,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
-  assert.strictEqual(lines.length - 1, tread(TA, "history", { type: "12" }).items.length);
-  // a write carrying reads answers in the mode of its session
-  const w0 = okData(mv("store", 12, 1, { ...at(1), reads: [{ action: "bootstrap" }] }));
+  // the dashboard is the same for everyone: totals yes, rows never
+  const dAnon = okData(get("dashboard"));
+  for (const tok of [TV, TS, TA]) assert.deepStrictEqual(tread(tok, "dashboard"), dAnon);
+  assert.ok(dAnon.kpi.treated_kg >= 150.5 && dAnon.months.some(m => m.treat_kg > 0));
+  assert.ok(!dAnon.recent.some(m => m.kind === "treat") && !/TR-/.test(JSON.stringify(dAnon)));
+  // a client flag never widens access
+  assert.strictEqual(tread(undefined, "bootstrap", { hideTreat: false, treat: true, role: "admin" }).treat, false);
+  // view / staff / admin: the rows, the details and the CSV column
+  for (const tok of [TV, TS, TA]) {
+    const th = tread(tok, "history", { kind: "treat" }).items;
+    assert.strictEqual(th.length, 2);
+    assert.strictEqual(th[1].method, "ระบบบำบัดน้ำเสียภายในโรงงาน");
+    assert.strictEqual(th[1].actor, ACTOR);
+    assert.strictEqual(tread(tok, "history").items.length, dataRows("movements"));
+    assert.strictEqual(tread(tok, "history", { q: "บำบัดน้ำเสีย" }).items.length, 1);
+    const bt = tread(tok, "batch", { reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] });
+    assert.strictEqual(bt.results[0].treat, true);
+    assert.strictEqual(bt.results[1].items.length, 2);
+    const c1 = tread(tok, "export", { type: "12" }).csv;
+    const lines = c1.trim().split("\n");
+    assert.ok(lines[0].includes(",\"น้ำหนัก (ตัน)\",") && lines[0].endsWith(",ผู้บันทึก,\"ระบบ / วิธีการ\""), lines[0]);
+    const tr = lines.find(x => x.startsWith(TR1.doc_no));
+    assert.ok(tr && tr.includes(",ข้อมูลภายใน,") && tr.includes(",ภายในโรงงาน,0.150,") && tr.endsWith(",ระบบบำบัดน้ำเสียภายในโรงงาน"), tr);
+    assert.strictEqual(lines.length - 1, tread(tok, "history", { type: "12" }).items.length);
+    // hidden on request (the page does this outside the ข้อมูลภายใน page)
+    assert.ok(tread(tok, "history", { hideTreat: true }).items.every(m => m.kind !== "treat"));
+  }
+  // a write carrying reads answers in the mode of its request
+  const w0 = okData(mv("store", 12, 1, { ...at(1), reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
   assert.strictEqual(w0.reads[0].treat, false);
-  assert.strictEqual(w0.reads[0].role, "staff");
-  assert.ok(!("treated_kg" in w0.reads[0].balance[12]));
-  const w1 = okData(mv("store", 12, 1, { ...at(1), token: TA, reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
+  assert.strictEqual(w0.reads[0].role, null);
+  assert.strictEqual(w0.reads[0].balance[12].treated_kg, 150.5, "totals are public");
+  assert.strictEqual(w0.reads[1].items.length, 0);
+  const w1 = okData(mv("store", 12, 1, { ...at(1), token: TS, reads: [{ action: "bootstrap" }, { action: "history", kind: "treat" }] }));
   assert.strictEqual(w1.reads[0].treat, true);
-  assert.strictEqual(w1.reads[0].role, "admin");
-  assert.strictEqual(w1.reads[0].balance[12].treated_kg, 150.5);
+  assert.strictEqual(w1.reads[0].role, "staff");
   assert.strictEqual(w1.reads[1].items.length, 2);
-  // dashboard "logs today" count leaves out in-house audit rows for non-admin
-  assert.ok(okData(get("dashboard")).logsToday < tread(TA, "dashboard").logsToday);
+  // the dashboard "logs today" count never counts in-house audit rows (same for everyone)
+  assert.strictEqual(okData(get("dashboard")).logsToday, tread(TA, "dashboard").logsToday);
 });
 
-test("treat rows: edit / delete by admin like any row (replay checked, audited); staff cannot", () => {
+test("treat rows: edit / delete by admin like any row (replay checked, audited); view / staff cannot", () => {
   const id = TR1.id;
   assert.strictEqual(err(post("movement_update", { id, weight_t: "0.1", token: TS }), /ผู้ดูแลระบบ/).code, "FORBIDDEN");
+  assert.strictEqual(err(post("movement_delete", { id, token: TV }), /ผู้ดูแลระบบ/).code, "FORBIDDEN");
+  assert.strictEqual(err(post("movement_delete", { id, token: undefined }), /ผู้ดูแลระบบ/).code, "AUTH_REQUIRED");
   // stock of type 12: 300 + 1 + 1 in, 100 shipped, 150 + 0.5 treated -> 51.5 left
   err(post("movement_update", { id, doc_no: TR1.doc_no, weight_t: "0.20151" }), /แก้ไขไม่ได้/);
   err(post("movement_update", { id, kind: "ship" }), /เปลี่ยนชนิดรายการไม่ได้/);
@@ -883,7 +897,7 @@ test("login: each password gives its level; token 64 hex in CacheService (12 h s
   clearFails();
   const puts = state.cachePuts.length;
   const now = Date.now();
-  for (const [pw, role, name] of [[VPW, "viewer", "เข้าดูได้อย่างเดียว"], [SPW, "staff", "พนักงานกรอกข้อมูล"], [RPW, "admin", "ผู้ดูแลระบบ"]]) {
+  for (const [pw, role, name] of [[VPW, "viewer", "ดูได้อย่างเดียว"], [SPW, "staff", "พนักงานกรอกข้อมูล"], [RPW, "admin", "ผู้ดูแลระบบ"]]) {
     const d = okData(loginRes(pw));
     assert.ok(/^[0-9a-f]{64}$/.test(d.token));
     assert.strictEqual(d.role, role);
@@ -909,45 +923,52 @@ test("login: each password gives its level; token 64 hex in CacheService (12 h s
   state.props.WASTE_STAFF_PASSWORD = SPW;
 });
 
-test("roles: every action x every level (server-side; viewer reads only, staff + store/opening/ship, admin all)", () => {
+test("roles: every action x every level, enforced on the server (open site; ข้อมูลภายใน write staff+; admin tools)", () => {
   const rows0 = dataRows("movements"), logs0 = dataRows("audit_logs");
-  const expect = { viewer: READS, staff: READS.concat(STAFF_WRITES), admin: ALL_ACTIONS };
-  for (const [role, tok] of [["viewer", TV], ["staff", TS], ["admin", TA]]) {
+  const allowed = {
+    anonymous: PUBLIC_ACTIONS, viewer: PUBLIC_ACTIONS,
+    staff: PUBLIC_ACTIONS.concat(STAFF_ONLY), admin: ALL_ACTIONS
+  };
+  for (const [lv, tok] of [["anonymous", undefined], ["viewer", TV], ["staff", TS], ["admin", TA]]) {
     for (const a of ALL_ACTIONS) {
-      // writes without a name stop right after the role check (nothing written)
+      // writes without a name stop right after the access check (nothing written)
       const r = postRaw({ action: a, token: tok, reads: a === "batch" ? [{ action: "bootstrap" }] : undefined }, null);
-      if (!expect[role].includes(a)) {
-        assert.strictEqual(r.ok, false, role + " " + a);
-        assert.strictEqual(r.code, "FORBIDDEN", role + " " + a + ": " + r.error);
-        assert.ok(/ต้องเป็น “(พนักงานกรอกข้อมูล|ผู้ดูแลระบบ)”/.test(r.error), r.error);
+      if (!allowed[lv].includes(a)) {
+        assert.strictEqual(r.ok, false, lv + " " + a);
+        assert.strictEqual(r.code, lv === "anonymous" ? "AUTH_REQUIRED" : "FORBIDDEN", lv + " " + a + ": " + r.error);
+        assert.ok(lv === "anonymous" ? /ต้องใส่รหัสผ่าน “(พนักงานกรอกข้อมูล|ผู้ดูแลระบบ)”/.test(r.error)
+          : /ต้องเป็น “(พนักงานกรอกข้อมูล|ผู้ดูแลระบบ)”/.test(r.error), r.error);
       } else if (READS.includes(a) || a === "logs" || a === "logs_export") {
-        assert.strictEqual(r.ok, true, role + " " + a + ": " + r.error);
+        assert.strictEqual(r.ok, true, lv + " " + a + ": " + r.error);
       } else {
-        assert.strictEqual(r.code, "NAME_REQUIRED", role + " " + a + ": " + r.error);
+        assert.strictEqual(r.code, "NAME_REQUIRED", lv + " " + a + ": " + r.error);
       }
     }
   }
   // the minimum level of each action, as the server enforces it
-  const minRole = a => READS.includes(a) ? "viewer" : STAFF_WRITES.includes(a) ? "staff" : "admin";
+  const minRole = a => PUBLIC_ACTIONS.includes(a) ? "public" : STAFF_ONLY.includes(a) ? "staff" : "admin";
   assert.deepStrictEqual(Object.keys(ctx.ACTION_ROLE).sort(), ALL_ACTIONS.slice().sort());
   ALL_ACTIONS.forEach(a => assert.strictEqual(ctx.ACTION_ROLE[a], minRole(a), a));
-  // a staff write really works; a viewer one is refused before anything is written
-  okData(mv("store", 1, 1, { container: "bigbag", containers: 1, ...at(1) }));
-  err(mv("store", 1, 1, { token: TV, container: "bigbag", containers: 1, ...at(1) }), /ต้องเป็น “พนักงานกรอกข้อมูล”/);
+  // a public write really works without any password; staff cannot use the admin tools
+  okData(mv("store", 1, 1, { token: undefined, container: "bigbag", containers: 1, ...at(1) }));
   err(post("type_save", { token: TS, code: "123456", name: "x", permit_tons: 1, mgmt_code: "011", receiver: "r" }), /ผู้ดูแลระบบ/);
   err(post("reset_data", { token: TS }), /ผู้ดูแลระบบ/);
+  err(post("logs", { token: TS }), /ผู้ดูแลระบบ/);
+  err(post("movement_delete", { token: TS, id: 1 }), /ผู้ดูแลระบบ/);
   assert.strictEqual(dataRows("movements"), rows0 + 1);
   assert.strictEqual(dataRows("audit_logs"), logs0 + 1, "refused requests are not audited (no lock taken)");
 });
 
-test("sessions: no / bad / unknown / expired token -> AUTH_REQUIRED on every action; logout ends a session", () => {
+test("sessions: no / bad / unknown / expired token -> AUTH_REQUIRED on password actions, anonymous on public ones; logout ends a session", () => {
   const before = dataRows("movements");
   for (const tok of [undefined, "", "x", "a".repeat(64), "A".repeat(64), { t: TA }, TA + "0"]) {
-    for (const a of ALL_ACTIONS) {
+    for (const a of STAFF_ONLY.concat(ADMIN_ONLY)) {
       const r = postRaw({ action: a, token: tok, type_id: 1, weight_t: "1", container: "drum200", containers: 1, resetPassword: RPW });
       assert.strictEqual(r.code, "AUTH_REQUIRED", a + " " + JSON.stringify(tok) + ": " + JSON.stringify(r));
-      assert.ok(/กรุณาเข้าสู่ระบบ/.test(r.error));
+      assert.ok(/ต้องใส่รหัสผ่าน/.test(r.error));
     }
+    assert.strictEqual(roleOf(tok), null, "public read: anonymous");
+    assert.strictEqual(okData(postRaw({ action: "history", kind: "treat", token: tok }, null)).items.length, 0);
   }
   assert.strictEqual(dataRows("movements"), before);
   // expired (absolute 12 h)
@@ -955,28 +976,31 @@ test("sessions: no / bad / unknown / expired token -> AUTH_REQUIRED on every act
   const rec = JSON.parse(state.cache["WASTE_SS_" + t]);
   rec.e = Date.now() - 1;
   state.cache["WASTE_SS_" + t] = JSON.stringify(rec);
-  for (const a of ["bootstrap", "store"]) assert.strictEqual(postRaw({ action: a, token: t }).code, "AUTH_REQUIRED");
+  assert.strictEqual(postRaw({ action: "treat", token: t }).code, "AUTH_REQUIRED");
+  assert.strictEqual(roleOf(t), null);
   // evicted / corrupt entry
   const t2 = login(VPW);
   state.cache["WASTE_SS_" + t2] = "{bad json";
-  assert.strictEqual(postRaw({ action: "bootstrap", token: t2 }).code, "AUTH_REQUIRED");
+  assert.strictEqual(roleOf(t2), null);
   state.cache["WASTE_SS_" + t2] = JSON.stringify({ r: "root", e: Date.now() + 1e6, p: Date.now(), f: "x" });
-  assert.strictEqual(postRaw({ action: "bootstrap", token: t2 }).code, "AUTH_REQUIRED");
+  assert.strictEqual(roleOf(t2), null);
   // logout
   const t3 = login(RPW);
-  assert.strictEqual(tread(t3, "bootstrap").role, "admin");
+  assert.strictEqual(roleOf(t3), "admin");
   assert.strictEqual(okData(rawPost({ action: "logout", token: t3 })).loggedOut, true);
   assert.ok(!("WASTE_SS_" + t3 in state.cache));
   assert.strictEqual(postRaw({ action: "logs", token: t3 }).code, "AUTH_REQUIRED");
+  assert.strictEqual(roleOf(t3), null);
   okData(rawPost({ action: "logout", token: "nope" })); // harmless
   okData(rawPost({ action: "logout" }));
-  // cache outage: sessions cannot be checked -> refused (never "logged in by default")
+  // cache outage: sessions cannot be checked -> no access (never "unlocked by default"), public reads still answer
   state.cacheDown = true;
   try {
-    assert.strictEqual(postRaw({ action: "bootstrap", token: TA }).code, "AUTH_REQUIRED");
+    assert.strictEqual(postRaw({ action: "logs", token: TA }).code, "AUTH_REQUIRED");
+    assert.strictEqual(roleOf(TA), null);
     err(loginRes(VPW));
   } finally { state.cacheDown = false; }
-  assert.strictEqual(tread(TA, "bootstrap").role, "admin"); // fine again afterwards
+  assert.strictEqual(roleOf(TA), "admin"); // fine again afterwards
 });
 
 test("sessions: the cache entry is renewed while in use (12 h > 6 h cache limit), never past the 12 h end", () => {
@@ -999,17 +1023,17 @@ test("sessions: the cache entry is renewed while in use (12 h > 6 h cache limit)
   assert.ok(rec.e < Date.now() + 3 * 3600e3 + 1000, "absolute end unchanged");
 });
 
-test("sessions: changing or removing a password ends the sessions of that level only; unset level cannot log in", () => {
+test("sessions: changing or removing a password ends the sessions of that level only; unset level cannot unlock", () => {
   const tv = login(VPW), ts = login(SPW);
   state.props.WASTE_STAFF_PASSWORD = "staff-pass-2";
-  assert.strictEqual(postRaw({ action: "bootstrap", token: ts }).code, "AUTH_REQUIRED");
+  assert.strictEqual(roleOf(ts), null);
   assert.strictEqual(tread(tv, "bootstrap").role, "viewer");
   err(loginRes(SPW), /รหัสไม่ถูกต้อง/);
   assert.strictEqual(okData(loginRes("staff-pass-2")).role, "staff");
   state.props.WASTE_STAFF_PASSWORD = SPW;
   clearFails();
   delete state.props.WASTE_VIEW_PASSWORD;
-  assert.strictEqual(postRaw({ action: "bootstrap", token: tv }).code, "AUTH_REQUIRED");
+  assert.strictEqual(roleOf(tv), null);
   err(loginRes(VPW), /รหัสไม่ถูกต้อง/);
   assert.strictEqual(okData(loginRes(SPW)).role, "staff"); // other levels still work
   state.props.WASTE_VIEW_PASSWORD = VPW;
@@ -1050,7 +1074,7 @@ test("login lockout: 5 wrong per browser (client id) and 30 wrong overall per 15
 test("reset_data: admin session + the admin password typed again (missing property, wrong password, lockout counter)", () => {
   const saved = state.props.WASTE_RESET_PASSWORD;
   delete state.props.WASTE_RESET_PASSWORD;
-  err(post("reset_data", {}), /เข้าสู่ระบบ/); // the admin session ends with the password
+  assert.strictEqual(err(post("reset_data", {}), /ต้องใส่รหัสผ่าน “ผู้ดูแลระบบ”/).code, "AUTH_REQUIRED"); // the admin session ends with the password
   state.props.WASTE_RESET_PASSWORD = saved;
   clearFails();
   err(post("reset_data", { resetPassword: "bad", client: "00112233445566aa" }), /รหัสไม่ถูกต้อง/);
@@ -1291,17 +1315,18 @@ test("sheet storage: numbers / codes / dates keep their formats (no Date convers
 });
 
 /* ---------- regressions (bug hunt 2026-10) ---------- */
-test("hidden mode: balance last_at never reveals the time of a treatment row", () => {
+test("no password: balance last_at never reveals the time of an in-house row (the total is public)", () => {
   const s = okData(mv("store", 2, 40, { container: "ibc", containers: 2, ...at(10) }));
   okData(mv("treat", 2, 5, { container: "ibc", containers: 1, ...at(1) }));
   const atStore = okData(get("history", { type: "2" })).items.find(m => m.doc_no === s.doc_no).moved_at;
   const hidden = boot().balance[2];
   assert.strictEqual(hidden.last_at, atStore);
-  assert.ok(!("last_vis_at" in hidden) && !("treated_kg" in hidden));
+  assert.ok(!("last_vis_at" in hidden));
   const shown = tread(TA, "bootstrap").balance[2];
   assert.strictEqual(shown.last_at, at(1).date + " 09:00:00");
   assert.ok(!("last_vis_at" in shown));
   assert.strictEqual(hidden.balance_kg, shown.balance_kg); // the balance itself stays true
+  assert.strictEqual(hidden.treated_kg, shown.treated_kg); // and the in-house total is public
   assert.strictEqual(okData(get("batch", { reads: JSON.stringify(["bootstrap"]) })).results[0].balance[2].last_at, atStore);
 });
 
@@ -1345,29 +1370,47 @@ test("docs JS files parse; config shape; POST text/plain only; token in the body
   const app = readDoc("docs/assets/app.js");
   assert.ok(app.includes("window.WASTE_CONFIG"));
   assert.ok(app.includes("'Content-Type': 'text/plain;charset=UTF-8'"));
-  assert.ok(!/method: 'GET'|searchParams\.set/.test(app), "no GET requests (a token never goes into a URL)");
+  assert.ok(!/method: 'GET'|searchParams\.set/.test(app), "the page only POSTs (a token never goes into a URL)");
   assert.ok(/actor: S\.user/.test(app) && app.includes("store('get', 'wasteUser')"));
   assert.ok(app.includes("'\\uFEFF' + r.csv"));
-  for (const a of ["store", "ship", "opening", "movement_update", "movement_delete", "type_save", "reset_data"]) assert.ok(new RegExp("NAME_REQUIRED = \\[[^\\]]*'" + a + "'").test(app), a);
+  for (const a of ["store", "ship", "opening", "treat", "movement_update", "movement_delete", "type_save", "reset_data"]) assert.ok(new RegExp("NAME_REQUIRED = \\[[^\\]]*'" + a + "'").test(app), a);
   for (const a of ["'movement_update'", "'movement_delete'", "'type_save'", "'logs'", "'logs_export'", "'batch'", "action: 'reset_data', resetPassword", "action: 'login', password", "action: 'logout', token"]) assert.ok(app.includes(a), a);
-  for (const gone of ["'treat_unlock'", "'treat_lock'", "verifyResetPassword", "askPassword", "recordPassword", "treatToken"]) assert.ok(!app.includes(gone), gone);
+  for (const gone of ["'treat_unlock'", "'treat_lock'", "verifyResetPassword", "recordPassword", "treatToken", "showLogin", "$('#login')", "HT_KEY", "#treatLock"]) assert.ok(!app.includes(gone), gone);
+  // open site: no login gate; the first thing the page does is draw the current page
+  assert.ok(/\npaintRole\(\);\r?\nroute\(\);\s*$/.test(app), "no login screen before the dashboard");
+  assert.ok(!/if \(!S\.sess\) \{ showLogin/.test(app));
   // session: token in sessionStorage + POST bodies only; passwords never stored
-  assert.ok(app.includes("if (S.sess) body.token = S.sess.t;") && app.includes("ss('set', SESS_KEY, JSON.stringify(S.sess))"));
+  assert.ok(app.includes("body.token = S.sess.t; // in the POST body only, never in a URL") && app.includes("ss('set', SESS_KEY, JSON.stringify(S.sess))"));
   assert.ok(!/localStorage\.setItem\([^)]*(SESS|sess|token)/i.test(app));
   assert.ok(!/(local|session)Storage\.setItem\([^)]*([Pp]ass|[Rr]eset)/.test(app));
   assert.ok(!/(store|ss)\('set', *'[^']*([Pp]ass|[Rr]eset)/.test(app));
-  assert.ok(app.includes("if (e.code === 'AUTH_REQUIRED') sessionEnded("));
-  // read cache: this tab only, never while in-house data is shown, never the log
-  assert.ok(app.includes("if (treatOn() || !S.sess) return null;") && app.includes("if (!d || treatOn() || !S.sess) return;"));
+  assert.ok(app.includes("if (e.code === 'AUTH_REQUIRED' && S.sess) sessionEnded("));
+  // in-house rows only on the unlocked ข้อมูลภายใน page; every other page asks the server to hide them
+  assert.ok(app.includes("const treatOn = () => can('viewer') && currentPage() === 'treat';"));
+  assert.ok(app.includes("if (!treatOn()) body.hideTreat = true;"));
+  // read cache: this tab only, never for the ข้อมูลภายใน page, never the log
+  assert.ok(app.includes("if (treatOn()) return null;") && app.includes("if (!d || treatOn()) return;"));
   assert.ok(!/localStorage\.setItem\(rcKey/.test(app) && app.includes("sessionStorage.setItem(rcKey(r), s)"));
   assert.ok(!/RC_PREFIX[^\n]*logs/.test(app));
-  // roles: pages, menus and buttons by level (the server checks again)
-  assert.ok(app.includes("const PAGE_ROLE = { store: 'staff', ship: 'staff', treat: 'admin', logs: 'admin', settings: 'admin' };"));
-  assert.ok(app.includes("const treatOn = () => can('admin') && !S.hideT;") && app.includes("body.hideTreat = true"));
-  assert.ok(app.includes("const acts = m => !can('admin') ? '' :") && app.includes("${can('staff') ? `<div class=\"reset-topbar\">"));
-  for (const a of ["treat: () => txForm('treat')", "k !== 'treat' || treatOn()"]) assert.ok(app.includes(a), a);
+  // pages that need a password: ข้อมูลภายใน (view; the form staff), Log / settings (admin)
+  assert.ok(app.includes("const PAGE_ROLE = { treat: 'viewer', logs: 'admin', settings: 'admin' };"));
+  assert.ok(app.includes("const pageNeed = (p = currentPage()) => (p === 'treat' && treatTab() === 'new' ? 'staff' : PAGE_ROLE[p] || '');"));
+  assert.ok(app.includes("const NAME_PAGES = ['store', 'ship'];"), "store / ship open to everyone (name only)");
+  assert.ok(app.includes("lockedPage(p, need);") && app.includes("await askUnlock(need)"));
+  assert.ok(app.includes("treat: ([h]) => treatPage(h)") && app.includes("historyPage(h, 'treat')") && app.includes("txForm('treat')"));
+  assert.ok(app.includes("$('#tbLock').onclick = lockNow;") && app.includes("$('#logoutBtn').onclick = lockNow;"));
+  // the server is the authority: a session it no longer knows ends here too
+  assert.ok(app.includes("if (S.sess && j.role === null) {") && app.includes("if (!applyBoot(res[0])) return;"));
+  // admin tools ask for the admin password on click (as before the login change)
+  assert.ok(app.includes("needRole('admin', 'การแก้ไขรายการต้องใช้รหัสผ่านผู้ดูแลระบบ')") && app.includes("needRole('admin', 'การลบรายการต้องใช้รหัสผ่านผู้ดูแลระบบ')"));
+  assert.ok(app.includes("const acts = m => `<div class=\"rec-acts\">"), "edit / delete buttons for everyone (password on click)");
+  // a lower-level password never replaces a higher session; the extra token is logged out
+  assert.ok(app.includes("if (!S.sess || ROLE_LV[r.role] >= ROLE_LV[S.sess.role]) {"));
+  // dashboard: the same for everyone, summary card always (labelled บำบัดเอง)
+  assert.ok(app.includes("${k.treated_kg !== undefined ? treatSummary(k) : ''}"));
+  assert.ok(!/treatSummary[^\n]*(can\(|treatOn\(\))/.test(app));
   // regression: the level painter must never match <body> (a fresh login hid the whole page)
-  assert.ok(app.includes("$$('.nav [data-role]').forEach(") && !/body\.dataset\.role|body\.setAttribute\('data-role'/.test(app));
+  assert.ok(app.includes("$$('.nav [data-lock]').forEach(") && !/body\.dataset\.role|body\.setAttribute\('data-role'/.test(app));
   // tons on the page: input / quick-add / exact conversion; kg only as a hint
   assert.ok(app.includes("/^\\d+(\\.\\d{1,5})?$/") && app.includes("weight_t: tonsStr(parseT(F.weight))"));
   assert.ok(app.includes("const QUICK_T = [0.1, 0.5, 1, 5, 10];"));
@@ -1393,27 +1436,32 @@ test("docs JS files parse; config shape; POST text/plain only; token in the body
   assert.ok(!/^(async )?function (history|location|name|status|close|open|print|stop|focus|blur|event)\(/m.test(app));
   // a save in flight: redrawing the summary (quick-add, typing, fresh data) never re-enables the button
   assert.ok(app.includes("if (!go || go.disabled || busy) return;") && app.includes("if (busy) { $('#fGo').disabled = true;"));
-  // Enter pressed again while a password is being checked: one request only (login)
+  // Enter pressed again while a password is being checked: one request only
   assert.ok(/onsubmit = async e => \{\r?\n\s+e\.preventDefault\(\);\r?\n\s+if \(go\.disabled\) return;/.test(app));
 });
 
-test("rename: the in-house feature is “ข้อมูลภายใน” everywhere on screen (internal keys unchanged)", () => {
+test("names: the menu / page is “ข้อมูลภายใน”, the public dashboard totals say “บำบัดเอง” (internal keys unchanged)", () => {
   const app = readDoc("docs/assets/app.js"), html = readDoc("docs/index.html"), readme = readDoc("README.md");
   const src = readDoc("apps-script/Code.gs");
+  const code = t => t.split(/\r?\n/).filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l)).join("\n").replace(/\/\/[^\n"']*$/gm, "");
   // only data values may still contain the word (seed waste name, preset system names)
   const strip = t => t.replace(/ตะกอนจากระบบบำบัดน้ำเสีย|ระบบบำบัดน้ำเสียภายในโรงงาน|บำบัดน้ำเสีย/g, "");
-  for (const [f, t] of [["app.js", app], ["index.html", html], ["Code.gs", src], ["README.md", readme]]) {
-    assert.ok(!/บำบัดเอง/.test(t), f + " still says บำบัดเอง");
+  for (const [f, t] of [["index.html", html], ["Code.gs (code)", code(src)]]) {
     assert.ok(!/บำบัด/.test(strip(t)), f + ": " + (strip(t).match(/.{0,30}บำบัด.{0,30}/) || [""])[0]);
   }
-  assert.ok(app.includes("treat:   { name: 'ข้อมูลภายใน', short: 'ข้อมูลภายใน'"));
+  for (const [f, t] of [["app.js", app], ["index.html", html], ["Code.gs", src], ["README.md", readme]]) assert.ok(!/บำบัดเองภายใน/.test(t), f + ": old menu name");
+  // app.js: “บำบัดเอง” only as the label of the public totals
+  assert.ok(strip(app).match(/บำบัด.{0,4}/g).every(x => x.startsWith("บำบัดเอง")), "only the word บำบัดเอง");
+  assert.ok(app.includes("['บำบัดเอง', k.treated_kg, 'fa-flask-vial'") && app.includes("label: 'บำบัดเอง (ตัน)'"));
+  assert.ok(app.includes("treat:   { name: 'ข้อมูลภายใน', short: 'ข้อมูลภายใน'") && app.includes("treat: ['ข้อมูลภายใน', "));
   assert.ok(html.includes('<span>ข้อมูลภายใน</span>'));
+  assert.ok(readme.includes("ข้อมูลภายใน") && readme.includes("บำบัดเอง"));
   assert.strictEqual(ctx.KIND_NAME.treat, "ข้อมูลภายใน");
   assert.strictEqual(ctx.PREFIX.treat, "TR"); // doc numbers unchanged
-  assert.ok(ctx.KINDS.includes("treat") && ctx.ACTION_ROLE.treat === "admin"); // API action / kind unchanged
+  assert.ok(ctx.KINDS.includes("treat") && ctx.ACTION_ROLE.treat === "staff"); // API action / kind unchanged
 });
 
-test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating icons, reduced motion, CDNs", () => {
+test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating icons, reduced motion, CDNs, cache busters", () => {
   const html = readDoc("docs/index.html"), css = readDoc("docs/assets/style.css");
   assert.ok(html.includes("<title>Balance Waste"));
   assert.strictEqual((html.match(/class="programming-credit">Programming by Duongruthai_Milk</g) || []).length, 2); // sidebar + footer
@@ -1430,13 +1478,18 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(html.includes("https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"));
   assert.ok(html.includes("family=Kanit") && html.includes("Prompt"));
   assert.ok(html.includes('id="userChip"') && html.includes('data-page="logs"') && html.includes('data-page="settings"'));
-  assert.ok(/data-page="treat"[^>]*id="treatNav" hidden/.test(html) && html.includes('id="treatLock" type="button" hidden'), "in-house menu + hide toggle hidden until an admin session");
-  // login screen + role-based menus + logout
-  assert.ok(html.includes('<div id="login" class="login">') && html.includes('id="logoutBtn"') && html.includes('id="roleTag"'));
-  for (const [pg, role] of [["store", "staff"], ["ship", "staff"], ["logs", "admin"], ["settings", "admin"]]) assert.ok(html.includes(`data-page="${pg}" data-role="${role}"`), pg);
-  assert.ok(css.includes(".login{position:fixed;inset:0;z-index:120") && css.includes(".login-logo{--sz:96px") && css.includes(".role-tag.r-admin"));
+  // open site: no login screen; every menu listed; ข้อมูลภายใน / Log / settings carry a lock until unlocked
+  assert.ok(!html.includes('id="login"') && !/class="login"/.test(html) && !css.includes(".login{"));
+  assert.ok(!/data-role=/.test(html), "no menu hidden by level");
+  assert.ok(/data-page="treat" class="treat-nav locked" id="treatNav" data-lock="viewer">[^\n]*<span>ข้อมูลภายใน<\/span><b class="tn-lock"/.test(html));
+  for (const pg of ["logs", "settings"]) assert.ok(new RegExp(`data-page="${pg}" class="locked" data-lock="admin">[^\\n]*tn-lock`).test(html), pg);
+  for (const pg of ["store", "ship"]) assert.ok(html.includes(`<a href="#${pg}" data-page="${pg}"><i`), pg);
+  assert.ok(!html.includes("treatLock"), "the old show / hide toggle is gone");
+  assert.ok(html.includes('id="logoutBtn" type="button" hidden') && html.includes('id="roleTag" hidden') && html.includes('<div class="user-box" id="userBox">'));
+  assert.ok(css.includes(".nav a.locked .tn-lock{display:inline-block}") && css.includes(".unlock-card{") && css.includes(".locked-page{") && css.includes(".treat-bar{") && css.includes(".role-tag.r-admin"));
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
-  assert.ok(html.includes("assets/app.js?v=6") && html.includes("assets/style.css?v=4"));
+  // cache busters bumped with this change
+  assert.ok(html.includes("assets/app.js?v=7") && html.includes("assets/style.css?v=5"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });
