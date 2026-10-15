@@ -1513,7 +1513,7 @@ test("index.html / style.css: brand, rainbow credit (7 colours, 21 s), rotating 
   assert.ok(css.includes(".nav a.locked .tn-lock{display:inline-block}") && css.includes(".unlock-card{") && css.includes(".locked-page{") && css.includes(".treat-bar{") && css.includes(".role-tag.r-admin"));
   assert.ok(css.includes("--treat:#7C3AED") && css.includes("@keyframes brew") && css.includes(".btn-treat"));
   // cache busters bumped with this change
-  assert.ok(html.includes("assets/app.js?v=8") && html.includes("assets/style.css?v=5"));
+  assert.ok(html.includes("assets/app.js?v=10") && html.includes("assets/style.css?v=5"));
   assert.ok(html.includes("82260007625693") && html.includes("2569-8409"));
   assert.ok(!/<script[^>]+src="(?!https:\/\/cdnjs\.cloudflare\.com\/|config\.js|assets\/app\.js)/.test(html));
 });
